@@ -17,7 +17,11 @@ import {
   isTransientNetworkError,
 } from '@codebuff/common/util/error'
 import { serializeCacheDebugCorrelation } from '@codebuff/common/util/cache-debug'
-import { systemMessage, userMessage } from '@codebuff/common/util/messages'
+import {
+  dropUnansweredToolCalls,
+  systemMessage,
+  userMessage,
+} from '@codebuff/common/util/messages'
 import { type ToolSet } from 'ai'
 import { cloneDeep, mapValues } from 'lodash'
 import z from 'zod/v4'
@@ -48,8 +52,8 @@ import {
   withSystemTags as withSystemTags,
   buildUserMessageContent,
   expireMessages,
-  filterUnfinishedToolCalls,
 } from './util/messages'
+import { recountContextTokens } from './util/context-token-count'
 import {
   countTokens,
   countTokensJson,
@@ -64,7 +68,10 @@ import type {
   StartAgentRunFn,
 } from '@codebuff/common/types/contracts/database'
 import type {
+  AgentUsageData,
   CacheDebugUsageData,
+  ContextCompactionData,
+  ModelUsageData,
   PromptAiSdkFn,
 } from '@codebuff/common/types/contracts/llm'
 import type { Logger } from '@codebuff/common/types/contracts/logger'
@@ -185,6 +192,9 @@ export const runAgentStep = async (
     trackEvent: TrackEventFn
     promptAiSdk: PromptAiSdkFn
     traceWriter?: TraceWriter
+    onAgentUsageReceived?: (usage: AgentUsageData) => void
+    onAgentUsageIncomplete?: () => void
+    onCompaction?: (data: ContextCompactionData) => void
   } & ParamsExcluding<
     typeof processStream,
     | 'agentContext'
@@ -310,7 +320,7 @@ export const runAgentStep = async (
   // and replayed, that one orphan would fail every later turn, so drop it here
   // — the single point every step's request is built — and assign the cleaned
   // history back so the checkpointed state is valid too.
-  const history = filterUnfinishedToolCalls(
+  const history = dropUnansweredToolCalls(
     expireMessages(agentState.messageHistory, 'agentStep'),
   )
 
@@ -526,6 +536,15 @@ export const runAgentStep = async (
     messages: [systemMessage(system), ...agentState.messageHistory],
     onCacheDebugProviderRequestBuilt,
     onCacheDebugUsageReceived,
+    onUsageReceived: params.onAgentUsageReceived
+      ? (usage: ModelUsageData) =>
+          params.onAgentUsageReceived?.({
+            ...usage,
+            isRoot: !agentState.parentId,
+            agentId: agentState.agentId,
+          })
+      : undefined,
+    onUsageIncomplete: params.onAgentUsageIncomplete,
     template: agentTemplate,
     onCostCalculated,
   })
@@ -937,7 +956,8 @@ export async function loopAgentSteps(
 
   // Convert tools to a serializable format for context-pruner token counting
   const toolDefinitions = mapValues(tools, (tool) => ({
-    description: tool.description,
+    description:
+      typeof tool.description === 'string' ? tool.description : undefined,
     inputSchema: tool.inputSchema as {},
   }))
 
@@ -974,6 +994,41 @@ export async function loopAgentSteps(
       }
     },
   )
+
+  // Recount against the history the turn actually ends with.
+  //
+  // Inside the loop the count is taken BEFORE the model call, so the last
+  // step's assistant response and every tool result it produced are missing
+  // from it — systematically the most recently added content, and on a step
+  // that read several files easily tens of thousands of tokens. That was
+  // harmless while the number only fed the compaction check, which runs again
+  // at the top of the next step anyway. It stops being harmless now that hosts
+  // persist it and show it to the user between turns.
+  //
+  // Same formula as estimateContextTokensLocally below, minus the step prompt:
+  // `system` and `toolsForTokenCount` are loop-invariant, and the step prompt
+  // is per-step scaffolding rather than part of the history the next turn is
+  // sent on top of. Once per turn against once per step is not a hot-path cost.
+  //
+  // Root agents only, which is the whole reason the count lives in its own
+  // module with a test: a subagent's final count is discarded with the
+  // subagent, and recounting it tokenizes that agent's entire history for
+  // nobody.
+  const recountContextTokensForTurnEnd = () => {
+    currentAgentState.contextTokenCount = recountContextTokens({
+      agentState: {
+        // `initialAgentState` is the same object `currentAgentState` points at
+        // (every reassignment below assigns it), so this is exactly the
+        // predicate the compaction callback already uses two hundred lines
+        // down: nothing a subagent computes here leaves the subagent.
+        parentId: initialAgentState.parentId,
+        messageHistory: currentAgentState.messageHistory,
+        contextTokenCount: currentAgentState.contextTokenCount,
+      },
+      systemPrompt: system,
+      toolsForTokenCount,
+    })
+  }
 
   let shouldEndTurn = false
   let hasRetriedOutputSchema = false
@@ -1045,6 +1100,13 @@ export async function loopAgentSteps(
           maxContextLength: contextPrunerBudgetForModel(agentTemplate.model),
           logger,
           runId,
+          onCompaction: (trigger) => {
+            if (initialAgentState.parentId) return
+            params.onCompaction?.({
+              trigger,
+              thresholdTokens: contextPrunerBudgetForModel(agentTemplate.model),
+            })
+          },
         })
         if (compacted) {
           currentAgentState.messageHistory = compacted
@@ -1208,6 +1270,8 @@ export async function loopAgentSteps(
       )
     }
 
+    recountContextTokensForTurnEnd()
+
     await finishAgentRun({
       ...params,
       runId,
@@ -1250,6 +1314,13 @@ export async function loopAgentSteps(
         },
         'Agent run cancelled by user (abort error)',
       )
+
+      // Same reason as the success path, and it matters more here: the branch
+      // above just appended another message to the history the caller keeps.
+      // Not the last edit, though — the SDK's buildCancelledSessionState drops
+      // unanswered tool calls and appends again at the persistence boundary,
+      // and carries this count across those edits itself.
+      recountContextTokensForTurnEnd()
 
       await finishAgentRun({
         ...params,
@@ -1305,6 +1376,9 @@ export async function loopAgentSteps(
     const statusCode = apiErrorDetails.statusCode
 
     const status = signal.aborted ? 'cancelled' : 'failed'
+    // A failed turn still leaves history behind, and the host still shows the
+    // user a context reading before their next message.
+    recountContextTokensForTurnEnd()
     await finishAgentRun({
       ...params,
       runId,

@@ -13,7 +13,7 @@ import { StopSequenceHandler } from '@codebuff/common/util/stop-sequence'
 import {
   streamText,
   generateText,
-  generateObject,
+  Output,
   NoSuchToolError,
   APICallError,
   ToolCallRepairError,
@@ -41,10 +41,8 @@ import type {
   PromptAiSdkStructuredOutput,
 } from '@codebuff/common/types/contracts/llm'
 import type { ParamsOf } from '@codebuff/common/types/function-params'
-import type { JSONObject } from '@codebuff/common/types/json'
 import type { ProviderMetadata } from '@codebuff/common/types/messages/provider-metadata'
 import type { LanguageModel } from 'ai'
-import type z from 'zod/v4'
 
 // Provider routing documentation: https://openrouter.ai/docs/features/provider-routing
 const providerOrder = {
@@ -71,13 +69,13 @@ export function getProviderOptions(params: {
   model: string
   runId: string
   clientSessionId: string
-  providerOptions?: Record<string, JSONObject>
+  providerOptions?: ProviderMetadata
   agentProviderOptions?: OpenRouterProviderRoutingOptions
   n?: number
   costMode?: string
   cacheDebugCorrelation?: string
   extraCodebuffMetadata?: Record<string, string>
-}): { codebuff: JSONObject } {
+}): ProviderMetadata {
   const {
     model,
     runId,
@@ -169,6 +167,7 @@ function emitCacheDebugUsage(params: {
   callback?: (usage: {
     inputTokens: number
     outputTokens: number
+    reasoningOutputTokens?: number
     cachedInputTokens: number
     totalTokens: number
   }) => void
@@ -176,7 +175,12 @@ function emitCacheDebugUsage(params: {
     inputTokens?: number
     outputTokens?: number
     totalTokens?: number
-    cachedInputTokens?: number
+    inputTokenDetails?: {
+      cacheReadTokens?: number
+    }
+    outputTokenDetails?: {
+      reasoningTokens?: number
+    }
   }
 }) {
   if (!params.callback) return
@@ -184,7 +188,13 @@ function emitCacheDebugUsage(params: {
   params.callback({
     inputTokens: params.usage.inputTokens ?? 0,
     outputTokens: params.usage.outputTokens ?? 0,
-    cachedInputTokens: params.usage.cachedInputTokens ?? 0,
+    ...(params.usage.outputTokenDetails?.reasoningTokens !== undefined
+      ? {
+          reasoningOutputTokens:
+            params.usage.outputTokenDetails.reasoningTokens,
+        }
+      : {}),
+    cachedInputTokens: params.usage.inputTokenDetails?.cacheReadTokens ?? 0,
     totalTokens: params.usage.totalTokens ?? 0,
   })
 }
@@ -221,6 +231,11 @@ export async function* promptAiSdkStream(
     prompt: undefined,
     model: aiSDKModel,
     messages: convertCbToModelMessages(params),
+    allowSystemInMessages: true,
+    include: {
+      ...streamParams.include,
+      requestBody: true,
+    },
     providerOptions: getProviderOptions({
       ...params,
       providerOptions: originalProviderOptions,
@@ -339,6 +354,54 @@ export async function* promptAiSdkStream(
     },
   })
 
+  let usageReported = false
+  let usageIncompleteReported = false
+  const reportUsageIncomplete = () => {
+    if (usageReported || usageIncompleteReported) return
+    usageIncompleteReported = true
+    params.onUsageIncomplete?.()
+  }
+  const reportUsage = (usage: {
+    inputTokens?: number
+    outputTokens?: number
+    totalTokens?: number
+    inputTokenDetails?: {
+      cacheReadTokens?: number
+    }
+    outputTokenDetails?: {
+      reasoningTokens?: number
+    }
+  }) => {
+    if (usageReported || usageIncompleteReported) return
+    usageReported = true
+    emitCacheDebugUsage({
+      callback: params.onCacheDebugUsageReceived,
+      usage,
+    })
+    emitCacheDebugUsage({
+      callback: params.onUsageReceived,
+      usage,
+    })
+  }
+
+  let costReported = false
+  let finishProviderMetadata: ProviderMetadata | undefined
+  const reportCost = async (providerMetadata: ProviderMetadata | undefined) => {
+    if (costReported) return
+    const openrouterUsage = providerMetadata?.codebuff?.usage as
+      | OpenRouterUsageAccounting
+      | undefined
+    const costOverrideDollars = openrouterUsage
+      ? (openrouterUsage.cost ?? 0) +
+        (openrouterUsage.costDetails?.upstreamInferenceCost ?? 0)
+      : undefined
+    if (!params.onCostCalculated || !costOverrideDollars) return
+    costReported = true
+    await params.onCostCalculated(
+      calculateUsedCredits({ costDollars: costOverrideDollars }),
+    )
+  }
+
   const stopSequenceHandler = new StopSequenceHandler(params.stopSequences)
 
   // Track if we've yielded any content - if so, we can't safely fall back
@@ -358,7 +421,7 @@ export async function* promptAiSdkStream(
   // iterator cleanly. Feed that through the same capped continuation path as a
   // clean end without a finish marker.
   let thrownStreamRecovery: StreamEndRecovery | undefined
-  const streamIterator = response.fullStream[Symbol.asyncIterator]()
+  const streamIterator = response.stream[Symbol.asyncIterator]()
   const recoverThrownStream = (error: unknown): StreamEndRecovery | null => {
     const recovery = classifyThrownStreamRecovery({
       aborted: params.signal.aborted,
@@ -382,6 +445,7 @@ export async function* promptAiSdkStream(
     try {
       iteration = await streamIterator.next()
     } catch (error) {
+      if (params.signal.aborted) reportUsageIncomplete()
       const recovery = recoverThrownStream(error)
       if (!recovery) throw error
       thrownStreamRecovery = recovery
@@ -389,8 +453,19 @@ export async function* promptAiSdkStream(
     }
     if (iteration.done) break
     const chunkValue = iteration.value
+    if (chunkValue.type === 'finish-step') {
+      finishProviderMetadata = chunkValue.providerMetadata as
+        | ProviderMetadata
+        | undefined
+    }
     if (chunkValue.type === 'finish') {
-      finishInfo = streamFinishInfoOf(chunkValue)
+      finishInfo = streamFinishInfoOf(
+        chunkValue,
+        typeof aiSDKModel !== 'string' &&
+          aiSDKModel.specificationVersion === 'v2',
+      )
+      if (finishInfo.hasUsage) reportUsage(chunkValue.totalUsage)
+      await reportCost(finishProviderMetadata)
     }
     if (chunkValue.type !== 'text-delta') {
       const flushed = stopSequenceHandler.flush()
@@ -404,6 +479,7 @@ export async function* promptAiSdkStream(
       }
     }
     if (chunkValue.type === 'error') {
+      if (params.signal.aborted) reportUsageIncomplete()
       // Error chunks are usually model/tool/API failures. Some runtimes surface
       // a response-body transport drop here instead of rejecting iterator.next;
       // the final branch below recognizes that one recoverable exception.
@@ -526,6 +602,7 @@ export async function* promptAiSdkStream(
     }
   }
 
+  if (params.signal.aborted) reportUsageIncomplete()
   if (thrownStreamRecovery && params.signal.aborted) {
     return promptAborted('User cancelled input')
   }
@@ -539,6 +616,7 @@ export async function* promptAiSdkStream(
       yieldedToolCall: hasYieldedToolCall,
     })
   if (recovery) {
+    reportUsageIncomplete()
     // The stream ended in a recoverable silent stop (connection cut, or
     // reasoning ended without an answer). Yield an error chunk instead of
     // ending like a normal completion: the agent loop appends the note to
@@ -589,26 +667,11 @@ export async function* promptAiSdkStream(
   })
 
   const usageResult = await response.usage
-  emitCacheDebugUsage({
-    callback: params.onCacheDebugUsageReceived,
-    usage: usageResult,
-  })
+  if (finishInfo?.hasUsage) reportUsage(usageResult)
+  else reportUsageIncomplete()
 
   const providerMetadata = (await response.providerMetadata) ?? {}
-  const openrouterUsage = providerMetadata.codebuff?.usage as
-    | OpenRouterUsageAccounting
-    | undefined
-  const costOverrideDollars = openrouterUsage
-    ? (openrouterUsage.cost ?? 0) +
-      (openrouterUsage.costDetails?.upstreamInferenceCost ?? 0)
-    : undefined
-
-  // Call the cost callback if provided
-  if (params.onCostCalculated && costOverrideDollars) {
-    await params.onCostCalculated(
-      calculateUsedCredits({ costDollars: costOverrideDollars }),
-    )
-  }
+  await reportCost(providerMetadata as ProviderMetadata)
 
   return promptSuccess(messageId)
 }
@@ -640,6 +703,11 @@ export async function promptAiSdk(
     prompt: undefined,
     model: aiSDKModel,
     messages: convertCbToModelMessages(params),
+    allowSystemInMessages: true,
+    include: {
+      ...params.include,
+      requestBody: true,
+    },
     providerOptions: getProviderOptions({
       ...params,
       agentProviderOptions: params.agentProviderOptions,
@@ -701,12 +769,14 @@ export async function promptAiSdkStructured<T>(
     userId: params.userId,
   })
 
-  const response = await generateObject<z.ZodType<T>, 'object'>({
+  const response = await generateText({
     ...params,
     prompt: undefined,
     model: aiSDKModel,
-    output: 'object',
+    output: Output.object({ schema: params.schema }),
     messages: convertCbToModelMessages(params),
+    allowSystemInMessages: true,
+    include: { requestBody: true },
     providerOptions: getProviderOptions({
       ...params,
       agentProviderOptions: params.agentProviderOptions,
@@ -724,7 +794,7 @@ export async function promptAiSdkStructured<T>(
     usage: response.usage,
   })
 
-  const content = response.object
+  const content = response.output
 
   const providerMetadata = response.providerMetadata ?? {}
   let costOverrideDollars: number | undefined

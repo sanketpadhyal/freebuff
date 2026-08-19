@@ -1,6 +1,9 @@
 import type { TrackEventFn } from './analytics'
 import type { SendActionFn } from './client'
-import type { OpenRouterProviderRoutingOptions , AgentTemplate } from '../agent-template'
+import type {
+  OpenRouterProviderRoutingOptions,
+  AgentTemplate,
+} from '../agent-template'
 import type { ParamsExcluding } from '../function-params'
 import type { Logger } from './logger'
 import type { Model } from '../../old-constants'
@@ -49,8 +52,23 @@ export type StreamChunk =
 export type CacheDebugUsageData = {
   inputTokens: number
   outputTokens: number
+  reasoningOutputTokens?: number
   cachedInputTokens: number
   totalTokens: number
+}
+
+/** Provider-reported usage for one model request. */
+export type ModelUsageData = CacheDebugUsageData
+
+/** Provider usage attributed by the runtime to the agent that made the request. */
+export type AgentUsageData = ModelUsageData & {
+  isRoot: boolean
+  agentId?: string
+}
+
+export type ContextCompactionData = {
+  trigger: 'context_limit' | 'cache_expiry' | 'context_limit_and_cache_expiry'
+  thresholdTokens: number
 }
 
 export type PromptAiSdkStreamFn = (
@@ -74,6 +92,9 @@ export type PromptAiSdkStreamFn = (
       normalizedBody?: unknown
     }) => void
     onCacheDebugUsageReceived?: (usage: CacheDebugUsageData) => void
+    onUsageReceived?: (usage: ModelUsageData) => void
+    /** The request ended without an exact final provider usage receipt. */
+    onUsageIncomplete?: () => void
     includeCacheControl?: boolean
     cacheDebugCorrelation?: string
     agentProviderOptions?: OpenRouterProviderRoutingOptions

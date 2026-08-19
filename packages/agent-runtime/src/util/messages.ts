@@ -29,14 +29,8 @@ export function messagesWithSystem(params: {
   return [systemMessage(system), ...messages]
 }
 
-export function asUserMessage(str: string): string {
-  return `<user_message>${str}${closeXml('user_message')}`
-}
-
 /**
  * Combines prompt, params, and content into a unified message content structure.
- * Always wraps the first text part in <user_message> tags for consistent XML framing.
- * If you need a specific text part wrapped, put it first or pre-wrap it yourself before calling.
  */
 export function buildUserMessageContent(
   prompt: string | undefined,
@@ -54,30 +48,10 @@ export function buildUserMessageContent(
     // If content has no meaningful text but prompt is provided, prepend prompt
     if (!hasNonEmptyText && promptHasNonWhitespaceText) {
       const nonTextContent = content.filter((p) => p.type !== 'text')
-      return [
-        { type: 'text' as const, text: asUserMessage(prompt!) },
-        ...nonTextContent,
-      ]
+      return [{ type: 'text' as const, text: prompt! }, ...nonTextContent]
     }
 
-    // Find the first text part and wrap it in <user_message> tags
-    let hasWrappedText = false
-    const wrappedContent = content.map((part) => {
-      if (part.type === 'text' && !hasWrappedText) {
-        hasWrappedText = true
-        // Check if already wrapped
-        const alreadyWrapped = parseUserMessage(part.text) !== undefined
-        if (alreadyWrapped) {
-          return part
-        }
-        return {
-          type: 'text' as const,
-          text: asUserMessage(part.text),
-        }
-      }
-      return part
-    })
-    return wrappedContent
+    return content
   }
 
   // Only prompt/params, combine and return as simple text
@@ -88,7 +62,7 @@ export function buildUserMessageContent(
   return [
     {
       type: 'text',
-      text: asUserMessage(textParts.join('\n\n')),
+      text: textParts.join('\n\n'),
     },
   ]
 }
@@ -309,55 +283,6 @@ export function expireMessages(
 
     return true
   })
-}
-
-/**
- * Removes tool calls from the message history that don't have corresponding tool responses.
- * This is important when passing message history to spawned agents, as unfinished tool calls
- * will cause issues with the LLM expecting tool responses.
- *
- * The function:
- * 1. Collects all toolCallIds from tool response messages
- * 2. Filters assistant messages to remove tool-call content parts without responses
- * 3. Removes assistant messages that become empty after filtering
- */
-export function filterUnfinishedToolCalls(messages: Message[]): Message[] {
-  // Collect all toolCallIds that have corresponding tool responses
-  const respondedToolCallIds = new Set<string>()
-  for (const message of messages) {
-    if (message.role === 'tool') {
-      respondedToolCallIds.add(message.toolCallId)
-    }
-  }
-
-  // Filter messages, removing unfinished tool calls from assistant messages
-  const filteredMessages: Message[] = []
-  for (const message of messages) {
-    // Session state arrives from clients, so don't assume the documented shape:
-    // a non-array content would throw below and turn a bad history into a 500.
-    if (message.role !== 'assistant' || !Array.isArray(message.content)) {
-      filteredMessages.push(message)
-      continue
-    }
-
-    // Filter out tool-call content parts that don't have responses
-    const filteredContent = message.content.filter((part) => {
-      if (part.type !== 'tool-call') {
-        return true
-      }
-      return respondedToolCallIds.has(part.toolCallId)
-    })
-
-    // Only include the assistant message if it has content after filtering
-    if (filteredContent.length > 0) {
-      filteredMessages.push({
-        ...message,
-        content: filteredContent,
-      })
-    }
-  }
-
-  return filteredMessages
 }
 
 export function getEditedFiles(params: {

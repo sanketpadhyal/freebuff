@@ -4,7 +4,8 @@ import {
   getZonedParts,
   type ZonedDateParts,
 } from '../util/zoned-time'
-import { mimoModels, moonshotModels, openrouterModels } from './model-config'
+import { isDeepSeekExpensiveWindow } from './freebuff-peak-hours'
+import { mimoModels } from './model-config'
 import {
   FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID,
   FREEBUFF_DEEPSEEK_V4_PRO_MODEL_ID,
@@ -14,6 +15,7 @@ import {
   FREEBUFF_AI_TRAINING_NOTICE,
   type FreebuffModelDataUse,
 } from './freebuff-data-use'
+import { clampReasoningEffort, type ReasoningEffort } from './reasoning-effort'
 
 export {
   FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID,
@@ -37,7 +39,7 @@ export interface FreebuffModelOption {
   /** One-line description shown next to the label. */
   tagline: string
   /** Availability policy for the selector and server-side admission. */
-  availability: 'always' | 'deployment_hours'
+  availability: 'always' | 'deployment_hours' | 'off_peak_only'
   /** Optional caveat shown in the picker (e.g. AI-training warning).
    *  Rendered in the warning/secondary color so users spot it before
    *  picking the model. */
@@ -58,13 +60,36 @@ export interface FreebuffModelOption {
    *  own (applyFreebuffReasoningDefaults in web/src/llm-api/openrouter.ts),
    *  and the Desktop and CLI pickers display the same field — one source, so
    *  on those surfaces what users see and what the server sends cannot drift.
-   *  (The web pickers don't render it yet.) Omit where the model has no effort
-   *  levels (MiniMax) or the provider default should stand untouched (GLM,
-   *  MiMo). CAUTION: the DeepSeek and MiMo adapters collapse anything below
-   *  `max` to `high` (toDeepSeekReasoningEffort / toMiMoReasoningEffort), so
-   *  rows on those lanes must stay `high` — a `medium` there would display as
-   *  medium and run as high, the exact drift this field exists to prevent. */
-  reasoningEffort?: 'low' | 'medium' | 'high'
+   *  Omit where the model has no effort levels (MiniMax) or the provider
+   *  default should stand untouched (GLM, MiMo). CAUTION: both DeepSeek V4
+   *  models expose low/high/max and neither has a distinct medium rung — see
+   *  DEEPSEEK_V4_REASONING_EFFORTS. */
+  /** Reasoning effort sent for this model, on the PROVIDER's own scale.
+   *  Deliberately wider than the shared agent-definition enum: Meta's ladder is
+   *  minimal/low/medium/high/xhigh (its own 400 names the set). Not every
+   *  provider accepts every rung, so each model still declares its own ladder. */
+  reasoningEffort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
+  /**
+   * The ladder a USER may pick from for this model, ascending. Absent means the
+   * model offers no choice and shows no control — the default for every row.
+   *
+   * Same field name and shape as Desktop's `ModelOption.efforts`
+   * (freebuff-desktop/src/shared/models.ts), deliberately: Desktop already had
+   * per-model effort lists driving its Claude/Codex picker, and one pattern
+   * across surfaces beats two that must be kept in step.
+   *
+   * Values must be native provider settings, not compatibility aliases or
+   * prompt approximations. The model's ordinary setting belongs in
+   * `defaultEffort`; rungs may sit on either side of it.
+   */
+  efforts?: readonly ReasoningEffort[]
+  /**
+   * Where `efforts` starts before a user touches it.
+   *
+   * Usually equal to `reasoningEffort`, but kept separate so a future model can
+   * expose a picker default that differs from its server-owned wire default.
+   */
+  defaultEffort?: ReasoningEffort
   /** Whether the model is still being trialed and may be unreliable. Surfaced
    *  in the picker as a "TEST" badge with a tooltip so users know it is not
    *  yet production-grade. */
@@ -101,25 +126,12 @@ export const FREEBUFF_GEMINI_PRO_MODEL_ID = 'google/gemini-3.1-pro-preview'
  *  chat code must use FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID instead. */
 export const FREEBUFF_DEEPSEEK_V4_FLASH_FIREWORKS_MODEL_ID =
   'fireworks/deepseek-v4-flash'
-/**
- * HY3 wire ids. REMOVED FROM FREEBUFF on 2026-08-04 — they are in no catalog,
- * no quota pool and no free-mode allowlist, so a free session can no longer be
- * admitted on either and the bundled roots are gone.
- *
- * The constants survive because `web/src/llm-api/hy3-fallback.ts` still routes
- * these slugs for paid/BYOK callers, exactly as paid Kimi outlived its Freebuff
- * removal. Nothing here should reach a Freebuff gate again: HY3 was withdrawn
- * during the initial web rollout and then sat in
- * FREEBUFF_WEB_RETIRED_PICKER_MODEL_IDS, which turned out not to be a gate at
- * all (see FREEBUFF_GLM_V52_MODEL_ID for what that cost).
- */
-export const FREEBUFF_HY3_OPENROUTER_FREE_MODEL_ID =
-  openrouterModels.openrouter_tencent_hy3_free
-export const FREEBUFF_HY3_OPENROUTER_PAID_MODEL_ID =
-  openrouterModels.openrouter_tencent_hy3
-/** Legacy alias retained for the direct Atlas fallback implementation. */
-export const FREEBUFF_HY3_ATLAS_MODEL_ID = FREEBUFF_HY3_OPENROUTER_PAID_MODEL_ID
-export const FREEBUFF_HY3_MODEL_ID = FREEBUFF_HY3_OPENROUTER_FREE_MODEL_ID
+// HY3 IS GONE, on every surface and every route (removed 2026-08-07). It left
+// Freebuff on 2026-08-04 but its wire ids lived on for paid/BYOK callers via
+// web/src/llm-api/hy3-fallback.ts; that file, the Atlas Cloud adapter that was
+// its paid lane, and the `tencent/hy3*` model-config entries have all been
+// deleted. Nothing routes these slugs now — a request for one falls through to
+// the ordinary unknown-model path.
 export const FREEBUFF_MIMO_V25_MODEL_ID = mimoModels.mimoV25
 /** GLM 5.2, served by CrofAI's direct OpenAI-compatible API (moved off
  *  Fireworks serverless 2026-07-29, at ~4x less than Fireworks' list price).
@@ -150,10 +162,12 @@ export const FREEBUFF_GLM_V52_MODEL_ID = 'z-ai/glm-5.2'
  *  and BYOK callers alike (see applyOpenRouterProviderRouting and
  *  applyFreebuffReasoningDefaults in web/src/llm-api/openrouter.ts):
  *
- *   - Routing is PINNED to OpenAI's own endpoint. OpenRouter also lists Azure
- *     and Amazon Bedrock for this model at $1.00/$6.00 per M — 10x OpenAI's
- *     $0.10/$0.60 — so unpinned routing is a silent 10x bill (cf. the
- *     Kimi/Infron unit-price doubling, 2026-07-29).
+ *   - Routing PREFERS OpenAI's own endpoint ($0.10/$0.60 per M) via `order`,
+ *     with fallbacks allowed and cost bounded by FREEBUFF_GPT_5_6_LUNA_MAX_PRICE
+ *     rather than by the pin. A hard pin (allow_fallbacks:false) held until
+ *     2026-08-16, when OpenAI began refusing every request from this account
+ *     ("Policy Violation: this user has been blocked") and took Luna to a 100%
+ *     failure rate with four usable endpoints sitting under the ceiling.
  *   - Reasoning effort is `high`. Luna is cheap enough per token that the
  *     quality is worth more than the reasoning tokens.
  *
@@ -161,12 +175,13 @@ export const FREEBUFF_GLM_V52_MODEL_ID = 'z-ai/glm-5.2'
  *  (agents/constants.ts) is this same model id, so keying either off the model
  *  alone would change Codebuff's paid lite mode as a side effect. */
 export const FREEBUFF_GPT_5_6_LUNA_MODEL_ID = 'openai/gpt-5.6-luna'
-/** OpenRouter provider slug Luna is pinned to. */
+/** OpenRouter provider slug Luna prefers (first in `provider.order`). */
 export const FREEBUFF_GPT_5_6_LUNA_PROVIDER_ROUTE = 'openai'
 /** Price ceiling for Luna, USD per million tokens. Sent as OpenRouter's
- *  `provider.max_price`, which REFUSES the request rather than serving above
- *  it, so a provider re-pricing surfaces as a loud error instead of a 10x
- *  invoice.
+ *  `provider.max_price`, which REFUSES to route above it rather than serving
+ *  and billing, so a provider re-pricing surfaces as a loud error instead of a
+ *  surprise invoice. Since 2026-08-16 this — not a hard provider pin — is the
+ *  sole cost guarantee, so it must not be widened casually.
  *
  *  This is a COST FENCE, not an assertion of the list price, and the gap is
  *  deliberate on both sides:
@@ -176,43 +191,54 @@ export const FREEBUFF_GPT_5_6_LUNA_PROVIDER_ROUTE = 'openai'
  *     found that satisfy the max price for this request" — verified against the
  *     live API on 2026-07-30, where 0.11/0.61 passed and 0.1/0.6 did not. A
  *     ceiling equal to list is an outage waiting on a rounding change.
- *   - It must sit WELL BELOW $1.00/$6.00, which is what Azure, Azure EU
- *     ($1.10/$6.60) and Amazon Bedrock charge for this model. Blocking those is
- *     the whole point.
+ *   - It must stay under the next tier up. Azure, Azure EU and Amazon Bedrock
+ *     listed $1.00/$6.00 when this was written and re-priced to $0.20/$1.20 by
+ *     2026-08-16; the ceiling admits them at today's price and would exclude
+ *     them again if they returned to the old one.
  *
- *  Half of Azure's price leaves room for OpenAI's own tiers (list $0.10/$0.60,
- *  priority $0.20/$1.20) and for ordinary price drift, while still failing
- *  closed long before a 10x endpoint could serve a request. */
+ *  The headroom covers OpenAI's own tiers (list $0.10/$0.60, priority
+ *  $0.20/$1.20, flex $0.05/$0.30) and ordinary price drift, while still failing
+ *  closed well before a 10x endpoint could serve a request. */
 export const FREEBUFF_GPT_5_6_LUNA_MAX_PRICE = {
   prompt: 0.5,
   completion: 3.0,
 } as const
 /** Reasoning effort every Luna turn runs at. */
 export const FREEBUFF_GPT_5_6_LUNA_REASONING_EFFORT = 'high' as const
-/** God-mode-only Laguna S 2.1 route used to test Poolside's direct
- *  OpenAI-compatible API before wider rollout. */
-export const FREEBUFF_POOLSIDE_LAGUNA_S_21_MODEL_ID = 'poolside/laguna-s-2.1'
-
 /**
- * Greg 2, served by CrofAI. God-only on Freebuff Web.
+ * Kimi K3 (Eco), served by CrofAI. God-only on Freebuff Web, for testing.
  *
- * The `crof/` prefix names the only place these exist — unlike the retired
+ * The `crof/` prefix names the only place this exists — unlike the retired
  * `crof/glm-5.2`, which was a SECOND id for a model already offered under
  * `z-ai/glm-5.2` and became a quota-bypass route. There is no other id for
- * these, so the prefix creates no such door.
+ * this, so the prefix creates no such door. (Note the paid `moonshotai/kimi-*`
+ * slugs in model-config.ts are different models on a different provider, not
+ * second doors onto this one.)
+ *
+ * `-eco` is load-bearing in the WIRE id and deliberately absent from the
+ * DISPLAY name. CrofAI serves two K3 builds — `kimi-k3` at $2.00/$8.00 per M
+ * and this Q2_K-quantized `kimi-k3-eco` at $1.00/$4.00 — so the id must name
+ * the exact build or a future `kimi-k3` row would collide with it. The picker
+ * label is plain "Kimi K3" by request; see KIMI_K3_ECO_MODEL.
  */
-export const FREEBUFF_GREG_2_ULTRA_MODEL_ID = 'crof/greg-2-ultra'
-export const FREEBUFF_GREG_2_SUPER_MODEL_ID = 'crof/greg-2-super'
-/** God-mode-only alias for testing the paid OpenRouter route independently
- *  from Poolside's direct API. OpenRouter receives `poolside/laguna-s-2.1`. */
-export const FREEBUFF_POOLSIDE_LAGUNA_S_21_OPENROUTER_MODEL_ID =
-  'openrouter/poolside/laguna-s-2.1'
-/** God-mode-only Ling 3.0 Flash (inclusionAI), a 124B MoE served free by
- *  OpenRouter. The id is OpenRouter's own slug, so it falls through to the
- *  default OpenRouter route with no provider-specific handler. Free endpoints
- *  are metered by OpenRouter per-account, so keep this god-only until its
- *  throughput under real turns is known. */
-export const FREEBUFF_LING_3_FLASH_MODEL_ID = 'inclusionai/ling-3.0-flash:free'
+export const FREEBUFF_KIMI_K3_ECO_MODEL_ID = 'crof/kimi-k3-eco'
+/**
+ * Extended-context tiers for the DeepSeek V4 and Luna routes.
+ *
+ * Wire ids only. These are provisioned per-account rather than offered from a
+ * client catalog, so they are deliberately absent from FREEBUFF_MODELS and
+ * from every quota list — a client that rendered one would offer a row most
+ * accounts cannot run. Requests carry the id directly on any free-mode root.
+ *
+ * Pricing and context windows track their base tier; the suffix names the
+ * provisioned variant, not a different model family, so nothing here needs a
+ * second entry in the price tables.
+ */
+export const FREEBUFF_DEEPSEEK_V4_PRO_MAX_MODEL_ID =
+  'deepseek/deepseek-v4-pro-max'
+export const FREEBUFF_DEEPSEEK_V4_FLASH_MAX_MODEL_ID =
+  'deepseek/deepseek-v4-flash-max'
+export const FREEBUFF_GPT_5_6_LUNA_MAX_MODEL_ID = 'openai/gpt-5.6-luna-max'
 
 /**
  * Claude Fable 5 — Anthropic's frontier model, offered to free CLI users as a
@@ -259,6 +285,71 @@ export const MUSE_SPARK_12_CONTRIBUTOR_UPSTREAM_MODEL_ID =
  *  https://dev.meta.ai/docs/pricing-rate-limits. */
 export const MUSE_SPARK_CONTRIBUTOR_RPM = 60
 /**
+ * Reasoning effort sent with every Muse Spark request.
+ *
+ * Muse Spark ALWAYS reasons — `reasoning_effort: "none"` is a hard 400 — so
+ * this chooses how much, not whether. The full ladder is
+ * minimal/low/medium/high/xhigh; Meta's own 400 on an unknown value names the
+ * set, which is the only place it is documented.
+ *
+ * Measured live 2026-08-06, same word problem, n=6 per level:
+ *
+ *   minimal   153 reasoning tokens   1.0s
+ *   low      ~300                    —
+ *   high      362                    1.9s
+ *   xhigh     391                    2.4s
+ *
+ * The top of the ladder is nearly flat: xhigh buys ~8% more reasoning than
+ * high, inside the run-to-run spread, and spends ~26% more latency for it.
+ * The real lever is downward — minimal is a 2.4x cut and still answered
+ * correctly on every sample. So read this constant as "max depth, latency
+ * accepted", and reach for `minimal` or `low` if a turn ever needs to feel
+ * fast. Cost barely enters into it: 500k output tokens across 347 prod
+ * requests came to roughly $0.10.
+ */
+export const FREEBUFF_MUSE_SPARK_REASONING_EFFORT = 'xhigh' as const
+
+/**
+ * The user-pickable ladders, named like Desktop's THROUGH_XHIGH / NO_XHIGH so
+ * the two catalogs read the same way.
+ *
+ * These are reusable provider-native ladders. A model's default is independent
+ * and may sit below the last rung.
+ */
+export const EFFORTS_THROUGH_HIGH = ['low', 'medium', 'high'] as const
+export const EFFORTS_THROUGH_XHIGH = [
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+] as const
+export const EFFORTS_THROUGH_MAX = [
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+] as const
+/**
+ * The three native DeepSeek V4 templates, shared by Flash 07/31 and Pro 08/13.
+ *
+ * DeepSeek publishes one requested→actual effort table for both models, and
+ * since the Pro 08/13 GA build it is genuinely identical (read off
+ * api-docs.deepseek.com/guides/thinking_mode, 2026-08-12): low→low, medium→high,
+ * high→high, xhigh→high, max→max. Pro used to collapse low into high, which is
+ * why it shipped a shorter ladder; that is no longer true, so the two rows now
+ * share this one. Medium is still not a distinct level on either model and is
+ * intentionally absent.
+ *
+ * The table is the ONLY source for this. DeepSeek's API accepts any
+ * `reasoning_effort` string without complaint — `"gigantic"` returns a normal
+ * 200 (verified against the live API, 2026-08-12) — so a rung being accepted
+ * proves nothing about it being distinct, and a ladder can never be derived by
+ * probing.
+ */
+const DEEPSEEK_V4_REASONING_EFFORTS = ['low', 'high', 'max'] as const
+/**
  * The marker that turns a Muse Spark rate limit into a queued turn rather than
  * a failed one.
  *
@@ -274,13 +365,29 @@ export const MUSE_SPARK_RATE_LIMITED_ERROR_CODE = 'muse_spark_rate_limited'
 /**
  * Where a rate-limited Muse Spark request goes instead of waiting.
  *
- * GPT-5.6 Luna, and the choice is constrained rather than free: the fallback
- * must be a model the caller is ALREADY entitled to, or a rate limit would
- * become a way to reach something they are not. Luna sits in the same shared
- * daily premium pool as Muse Spark (FREEBUFF_WEB_PREMIUM_MODEL_IDS), so a
- * rerouted request draws on exactly the quota the original would have.
+ * DeepSeek V4 Flash since 2026-08-18, when V4 Pro was paused for free mode (it
+ * held this from 2026-08-12, and GPT-5.6 Luna before that). The choice is
+ * constrained rather than free on two counts, and Flash satisfies both for the
+ * same reasons Pro did:
+ *
+ *  - The fallback must be a model the caller is ALREADY entitled to, or a rate
+ *    limit would become a way to reach something they are not. Flash sits in the
+ *    same shared daily premium pool as Muse Spark
+ *    (FREEBUFF_WEB_PREMIUM_MODEL_IDS) — it joined that pool the same day — so a
+ *    rerouted request draws on exactly the quota the original would have.
+ *  - It should be the model we would recommend anyway, since the user never
+ *    chose it: Flash is now DEFAULT_FREEBUFF_WEB_MODEL_ID, so a reroute lands on
+ *    the same model a new thread would have started on.
+ *
+ * Both bullets are why this had to move with the pause rather than after it: a
+ * fallback pointing at a paused model turns a queue overflow into a refusal.
+ *
+ * Being text-only costs this nothing: images reaching a Freebuff model that
+ * cannot see pixels are converted to vision-model descriptions at the
+ * completions layer (getFreebuffModelImageSupport gates it), so a rerouted turn
+ * carrying an image still reads it.
  */
-export const MUSE_SPARK_FALLBACK_MODEL_ID = FREEBUFF_GPT_5_6_LUNA_MODEL_ID
+export const MUSE_SPARK_FALLBACK_MODEL_ID = FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID
 
 /**
  * How long a caller may be asked to wait before the request is rerouted.
@@ -295,9 +402,11 @@ export const MUSE_SPARK_FALLBACK_MODEL_ID = FREEBUFF_GPT_5_6_LUNA_MODEL_ID
 export const MUSE_SPARK_FALLBACK_AFTER_MS = 10_000
 
 /** Picker copy for the tagline tooltip, and the single source for it — the
- *  server's behavior and the row's promise must not drift. */
+ *  server's behavior and the row's promise must not drift. Names the model
+ *  MUSE_SPARK_FALLBACK_MODEL_ID actually points at; a catalog invariant test
+ *  checks the two agree. */
 export const MUSE_SPARK_FALLBACK_NOTICE =
-  'Falls back to GPT-5.6 Luna if the queue is too long.'
+  'Falls back to DeepSeek V4 Flash if the queue is too long.'
 
 /** UI-only rollout switch. Backend support and free-mode allowlists remain
  *  wired even when these models are hidden from the Freebuff picker. */
@@ -308,12 +417,69 @@ export const FREEBUFF_ENABLE_STREAK_IN_UI = true
  *  limited access so the limited Freebuff UX can be exercised without an env
  *  var. */
 export const FREEBUFF_FORCE_LIMITED_MODE = false
-export const FREEBUFF_PREMIUM_SESSION_LIMIT = 6
-export const FREEBUFF_LIMITED_SESSION_LIMIT = 6
-/** Full-access Web/Cloud models outside the premium/referral pools. The CLI
- * keeps these models unlimited; browser surfaces cap fresh sessions to deter
- * automated project/session churn. */
-export const FREEBUFF_WEB_STANDARD_SESSION_LIMIT = 6
+/**
+ * Base premium sessions per Pacific day, before anything is earned.
+ *
+ * 5 → 4 when Levels shipped (`freebuff-levels.ts`), and the small size of that
+ * cut is the design. A free tier whose floor already hands out everything has
+ * nothing left to reward with — but a floor that COLLAPSES is a regression
+ * every existing user feels on the same afternoon, and no amount of "you can
+ * earn it back" reads as anything other than a takeaway. One session is what
+ * an honest account loses; Levels then take it to 7, which is more than
+ * anybody had before.
+ *
+ * Referral, streak, bounty and operator entitlement still add on top of this,
+ * unchanged.
+ */
+export const FREEBUFF_PREMIUM_SESSION_LIMIT = 4
+/**
+ * Limited-region base sessions per Pacific day.
+ *
+ * 6 → 3, the one genuinely large cut, and it is aimed rather than broad:
+ * `docs/freebuff-trust-levels.md` records that the brand-new-account /
+ * unsupported-region / often-VPN intersection is the exact shape of the
+ * reselling farms, and this is the pool they drain. A real developer abroad
+ * climbs straight back past where they started — Levels take this to 7 — while
+ * an account minted to be drained never earns a single rung.
+ */
+export const FREEBUFF_LIMITED_SESSION_LIMIT = 3
+
+/**
+ * What those two pools paid BEFORE Levels, and the revert lever.
+ *
+ * `FREEBUFF_LEVEL_SESSIONS=off` selects these instead of the reduced bases
+ * above, and suppresses the level bonus with them. The two halves have to move
+ * together: a reduced base with the ladder switched off is a pure takeaway,
+ * which is the one configuration this feature must never be able to land in.
+ * That is why the switch gates the whole change rather than just the bonus.
+ *
+ * Delete both, and the branch in `free-session/public-api.ts` that reads them,
+ * once Levels has been on long enough that rolling back is not a thing anyone
+ * would do.
+ */
+export const FREEBUFF_PRE_LEVELS_PREMIUM_SESSION_LIMIT = 5
+export const FREEBUFF_PRE_LEVELS_LIMITED_SESSION_LIMIT = 6
+/**
+ * There is no standard-model session limit, on any surface.
+ *
+ * `FREEBUFF_WEB_STANDARD_SESSION_LIMIT` used to live here at 6, capping fresh
+ * standard sessions on browser surfaces only — unlimited in CLI and Desktop,
+ * six a day in Web and Cloud. Removed on 2026-08-18, because a product whose
+ * central promise is "Freebuff is free" cannot have that promise be true on
+ * one surface and not another, with no way for a user to discover the
+ * difference except by hitting it.
+ *
+ * It was also close to redundant. `docs/freebuff-trust-levels.md` argues at
+ * length that session COUNT is the wrong thing to meter — starting a session
+ * costs nothing and an idle session costs nothing, while the traffic inside it
+ * is bounded four separate ways (`messagesPerDay`, `messagesPer5Hours`,
+ * `userMessagesPerDay`, and the daily spend ceiling). The churn it was aimed
+ * at is project creation, which has its own gate
+ * (`docs/freebuff-web-creation-gate.md`).
+ *
+ * Levels therefore scale only the two pools that are genuinely scarce: premium
+ * and the limited region. See `freebuff-levels.ts`.
+ */
 export const FREEBUFF_PREMIUM_SESSION_RESET_TIMEZONE = 'America/Los_Angeles'
 export const FREEBUFF_PREMIUM_SESSION_PERIOD = 'pacific_day'
 /** GLM 5.2 referral-reward session pool. Distinct from the shared premium
@@ -344,10 +510,6 @@ export const FREEBUFF_GLM_V52_SESSION_LENGTH_MS = 60 * 60 * 1000
 export const FREEBUFF_LIMITED_SESSION_RESET_TIMEZONE =
   FREEBUFF_PREMIUM_SESSION_RESET_TIMEZONE
 export const FREEBUFF_LIMITED_SESSION_PERIOD = FREEBUFF_PREMIUM_SESSION_PERIOD
-export const FREEBUFF_WEB_STANDARD_SESSION_RESET_TIMEZONE =
-  FREEBUFF_PREMIUM_SESSION_RESET_TIMEZONE
-export const FREEBUFF_WEB_STANDARD_SESSION_PERIOD =
-  FREEBUFF_PREMIUM_SESSION_PERIOD
 
 /**
  * Streak rewards. Once a user reaches a `FREEBUFF_STREAK_REWARD_INTERVAL_DAYS`
@@ -378,6 +540,16 @@ export const FREEBUFF_STREAK_GLM_BONUS_ENABLED = true
 /** Session units added to an eligible streak-reward pool. One whole session. */
 export const FREEBUFF_STREAK_BONUS_SESSION_UNITS = 1
 
+/** How much history the account hub's activity map covers. A year, matching
+ *  what the grid can legibly draw at 53 columns. Free: the map is drawn from
+ *  one narrow row per active day. */
+export const FREEBUFF_USAGE_MAP_DAYS = 365
+
+/** Lookback for the hub's token and message totals, which are aggregated from
+ *  `message` on demand. Days rather than months on purpose: that table's cost
+ *  scales with how much the account sent, not with the calendar. */
+export const FREEBUFF_RECENT_TOKENS_DAYS = 7
+
 /** Which session pool a streak bonus credit applies to. `premium` and `limited`
  *  are the daily pools (full vs limited access); `glm` is the weekly GLM 5.2
  *  pool (full access only). */
@@ -397,11 +569,23 @@ interface LocalTimeFormatOptions {
 }
 
 /** Full-access freebuff models that benefit from spawning the gemini-thinker
- *  subagent for deeper reasoning. Covers every full-access picker model except
- *  the two limited-tier ones (DeepSeek V4 Flash, MiMo 2.5). Used by the CLI to
- *  toggle the gemini-thinker spawnable + prompts based on the user's pick, and
- *  by the server to admit gemini-thinker child requests against a parent
- *  session bound to one of these models. */
+ *  subagent for deeper reasoning. Used by the CLI to toggle the gemini-thinker
+ *  spawnable + prompts based on the user's pick, and by the server to admit
+ *  gemini-thinker child requests against a parent session bound to one of
+ *  these models.
+ *
+ *  This used to be "every full-access picker model except the limited-tier
+ *  ones", and that rule no longer describes the list. DeepSeek V4 Flash left
+ *  the limited tier on 2026-08-18 and is now premium, yet it is deliberately
+ *  still OUT: a thinker child is an extra Gemini Pro call on top of the parent
+ *  turn, and Flash now carries the bulk of free-mode traffic. Adding it would
+ *  multiply exactly the cost the same day's changes were made to contain.
+ *  Membership is a cost decision now, not a tier one.
+ *
+ *  V4 Pro stays listed while paused. The check only ever runs against a row's
+ *  bound model, and no row can be bound to a paused model, so the entry is
+ *  inert — and it means the thinker comes back with Pro in one edit instead of
+ *  being forgotten. */
 export const FREEBUFF_GEMINI_THINKER_PARENT_MODELS = new Set<string>([
   FREEBUFF_DEEPSEEK_V4_PRO_MODEL_ID,
   FREEBUFF_MINIMAX_M3_MODEL_ID,
@@ -420,6 +604,8 @@ export function canFreebuffModelSpawnGeminiThinker(modelId: string): boolean {
  * spec sheet, so it is the limit the provider actually enforces:
  *   minimax-m3            "model maximum context length: 524287"
  *   deepseek-v4-flash     "model maximum context length: 1048575"
+ *   deepseek-v4-pro       "This model's maximum context length is 1048576
+ *                          tokens. However, you requested 1300092 tokens"
  *   kimi-k2.7-code        "Range of input length should be [1, 262144]"
  *
  * The consumer is agents/base-chat.ts, which prunes a chat thread's replayed
@@ -437,6 +623,13 @@ export function canFreebuffModelSpawnGeminiThinker(modelId: string): boolean {
 export const FREEBUFF_MODEL_CONTEXT_WINDOWS: Record<string, number> = {
   [FREEBUFF_MINIMAX_M3_MODEL_ID]: 524_288,
   [FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID]: 1_048_576,
+  // Read off the rejection above on 2026-08-12 — the same window as Flash, and
+  // the entry Pro had been missing since it shipped. Absent, base-chat gave a
+  // million-token model FREEBUFF_DEFAULT_CONTEXT_WINDOW's 131_072 and summarized
+  // a Pro chat thread at ~52k estimated tokens, 8x early. Unlike Luna and Muse
+  // Spark below this is an observed limit rather than a published one, so it is
+  // entered exactly.
+  [FREEBUFF_DEEPSEEK_V4_PRO_MODEL_ID]: 1_048_576,
   // Luna is the one entry not read off a provider rejection. Every Luna
   // endpoint OpenRouter lists (OpenAI, its flex/priority tiers, Azure, Bedrock)
   // declares context_length 1_050_000, verified against the live endpoints API
@@ -462,7 +655,9 @@ export const FREEBUFF_MODEL_CONTEXT_WINDOWS: Record<string, number> = {
 export const FREEBUFF_DEFAULT_CONTEXT_WINDOW = 131_072
 
 /** The "a better model exists" copy every superseded model points at, shared so
- *  three rows can't drift into three different sentences.
+ *  the rows that carry it can't drift into different sentences. Two rows do
+ *  today — MiniMax M3 and MiMo 2.5. (DeepSeek V4 Pro was the third until its
+ *  08/13 GA build overtook Flash again; see DEEPSEEK_V4_PRO_MODEL.)
  *
  *  Names the DATED build. The wire id is undated and auto-updates, so the row a
  *  user is being steered TO is labelled "DeepSeek V4 Flash 07/31" in every
@@ -475,34 +670,104 @@ export const FREEBUFF_DEFAULT_CONTEXT_WINDOW = 131_072
 const FLASH_SUPERSEDES_NOTICE =
   'DeepSeek V4 Flash 07/31 performs better for most tasks.'
 
+/* The Pro equivalent of the notice above lived here and was deleted on
+ * 2026-08-18: nothing may steer a user TOWARD a model we are steering them off,
+ * so its only referrer (GPT-5.6 Luna) now points at Flash. The reasoning it
+ * carried is worth reading in git before writing anything like it again — it
+ * was a SECOND notice on purpose, because Flash's steers off models that are
+ * dearer AND weaker, while against Luna the cost comparison did not cleanly
+ * favor either side. */
+
+/** The steer off a model that is dearer but NOT worse, which is V4 Pro since
+ *  2026-08-19.
+ *
+ *  A third notice rather than reusing FLASH_SUPERSEDES_NOTICE, and the reason
+ *  is that the other one makes a claim this one must not: "performs better for
+ *  most tasks" is true of Flash against MiniMax M3 and false of Flash against
+ *  the Pro 08/13 GA build, which beat it on every agentic benchmark we run.
+ *  Reusing it would have the picker tell users something we know to be untrue,
+ *  in a product where the picker is the only place most of them read anything.
+ *
+ *  So this steers on the two facts that ARE true and that a user cannot see:
+ *  both rows spend the same daily session, and one of them costs us several
+ *  times more per turn. "Recommended" is a claim about our advice, which we own
+ *  outright — no benchmark can contradict it. */
+const FLASH_RECOMMENDED_NOTICE =
+  'DeepSeek V4 Flash 07/31 is the recommended pick and uses the same session.'
+
+/**
+ * DeepSeek V4 Pro, on the 08/13 GA build (2026-08-12).
+ *
+ * SAME ENDPOINT AND SAME WIRE ID as the preview build it replaces, and that is
+ * not an assumption: DeepSeek direct serves only the undated ids, so the GA
+ * build arrived on `deepseek-v4-pro` with no route to add. Every dated slug is
+ * refused outright — `deepseek-v4-pro-0813` returns "The supported API model
+ * names are deepseek-v4-pro or deepseek-v4-flash" (verified against the live
+ * API, 2026-08-12), and /v1/models lists exactly the two undated ids. So there
+ * is nothing to plumb for a new build; what changes is what this row SAYS.
+ *
+ * Pricing was unchanged by the GA release, but DeepSeek repriced the whole
+ * family at 16:00 UTC on 2026-08-16 and split it into peak and off-peak cards:
+ * $0.66 in / $0.022 cache read / $1.98 out per M off-peak, exactly double that
+ * at peak (01:00-04:00 and 06:00-10:00 UTC). DEEPSEEK_V4_PRO_PRICING in
+ * web/src/llm-api/deepseek.ts carries both.
+ */
 const DEEPSEEK_V4_PRO_MODEL = {
   id: FREEBUFF_DEEPSEEK_V4_PRO_MODEL_ID,
+  // Dated for the same reason Flash is: the wire id is undated and auto-updates,
+  // so an undated label tells a returning user nothing changed when in fact the
+  // GA build is a different model from the preview they formed an opinion about.
+  // UNDATED as of 2026-08-19, and that is a correction rather than a style
+  // change. The rule here is that a name must identify the build a user
+  // actually gets, and Pro stopped having one: the CrofAI lane serves the
+  // undated `deepseek-v4-pro` snapshot while the direct lane serves 08/13, and
+  // which one answers depends on the hour (see the peak-window gating in
+  // deepseek-router.ts). "08/13" was true of only one of those, so it promised
+  // a build we may not hand over.
   displayName: 'DeepSeek V4 Pro',
+  // No longer a superlative. Pro is not the recommendation — it is the
+  // expensive row that a user may still choose — so the tagline describes it
+  // instead of ranking it. "Smartest" read as a recommendation the rest of the
+  // catalog no longer makes.
   tagline: 'Deep reasoning',
-  availability: 'always',
+  // Unavailable 00:00-10:00 UTC (5pm-3am Pacific) as of 2026-08-19 — see
+  // DEEPSEEK_EXPENSIVE_WINDOW_UTC. Pro is the dearest row we serve and DeepSeek
+  // doubles every rate inside that window, so it is closed rather than merely
+  // discouraged there. The hour of lead-in exists because a session admitted
+  // just before peak keeps its model for a full hour.
+  availability: 'off_peak_only',
   warning: FREEBUFF_AI_TRAINING_NOTICE,
   dataUse: 'training',
   premium: true,
   multimodal: false,
   // DeepSeek's own documented default (thinking on, effort high,
-  // api-docs.deepseek.com/guides/thinking_mode), now sent explicitly so a
-  // provider-side default change cannot silently move Freebuff. Flash and Pro
-  // run a four-lane cascade (deepseek-router.ts), and the explicit value
-  // reaches every lane: direct translates it to `thinking`, CrofAI maps it to
-  // its `reasoning_effort`, Infron and OpenRouter take `reasoning` natively.
-  // That is deliberate — one row, one behavior on whichever lane serves it —
-  // but only the direct lane's default was measured; if a fallback lane's own
-  // default was lower, its turns now spend more reasoning tokens.
+  // api-docs.deepseek.com/guides/thinking_mode), sent explicitly so a
+  // provider-side default change cannot silently move Freebuff.
   reasoningEffort: 'high',
-  // DeepSeek's V4-Flash-0731 GA build (2026-07-31) was re-post-trained for
-  // agent work and now beats V4 Pro on coding and tool-use benchmarks, while
-  // being cheaper and outside the premium pool. Pro stays selectable for people
-  // who want its longer deliberation, but the picker says so plainly.
+  // Low maps to a real low template on these builds, so Pro offers the same
+  // three rungs as Flash. See DEEPSEEK_V4_REASONING_EFFORTS.
+  efforts: DEEPSEEK_V4_REASONING_EFFORTS,
+  defaultEffort: 'high',
+  // Steered OFF again as of 2026-08-19, on cost rather than on quality — and
+  // the distinction is the whole reason this notice is not the one MiniMax M3
+  // carries. Pro held a "V4 Flash performs better" notice until its 08/13 GA
+  // build won the agentic benchmarks back (Terminal Bench 2.1 72.1 → 87.9,
+  // DeepSWE 12.8 → 62.7, SWE-bench Verified 80.6%). Those numbers still stand;
+  // claiming Flash is the better model would be false.
+  //
+  // What changed is the price of being right. Pro reads cache at $0.022/M
+  // off-peak and $0.044/M at peak on the direct lane, against Flash's far
+  // cheaper rate, and cache reads are ~98% of an agent turn. Both rows draw on
+  // the SAME daily premium pool, so a user picking Pro spends the same quota
+  // for several times the money — which is what makes the honest steer "Flash
+  // is what we recommend", not "Flash is better".
   supersededBy: {
     modelId: FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID,
-    notice: FLASH_SUPERSEDES_NOTICE,
+    notice: FLASH_RECOMMENDED_NOTICE,
     actionLabel: 'Switch to V4 Flash',
   },
+  // No `isNew`. The badge exists to pull attention to a row, which is the
+  // opposite of what this one should do now.
 } as const satisfies FreebuffModelOption
 
 const MIMO_V25_MODEL = {
@@ -513,16 +778,26 @@ const MIMO_V25_MODEL = {
   dataUse: 'service',
   premium: false,
   multimodal: true,
-  // Same price as Flash and outclassed by it, so there is no cost argument to
-  // weigh — just a better model. Note this is the limited tier's other pick and
-  // its only natively-multimodal one; steering off it is only reasonable
-  // because Flash reads images through the describe pipeline on every surface
-  // (server/images/describe.ts, server/chat/image-context.ts).
-  supersededBy: {
-    modelId: FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID,
-    notice: FLASH_SUPERSEDES_NOTICE,
-    actionLabel: 'Switch to V4 Flash',
-  },
+  // Xiaomi exposes only disabled and high (enabled) for MiMo 2.5. Since the
+  // product has no separate thinking on/off control, there is no depth ladder
+  // to render here; low/medium/max would merely be compatibility aliases.
+  // NOT superseded as of 2026-08-18, and the reason is the whole point of the
+  // pause. The pointer to Flash rested on "same price, strictly better model,
+  // so there is no cost argument to weigh". Flash costing a premium session
+  // ended that: MiMo is now the only UNLIMITED row and the target of
+  // FALLBACK_FREEBUFF_MODEL_ID, so this row is precisely where a user lands
+  // when their premium pool is spent.
+  //
+  // Two things went wrong while the pointer was still here, and both are worse
+  // than a stale nudge:
+  //  - `migrateSupersededFreebuffModelPreference` rewrites a SAVED pick on
+  //    every load, so a user who deliberately chose the unlimited model was
+  //    silently moved onto the premium one at each launch.
+  //  - The picker nagged "switch to V4 Flash" on the very row it had just
+  //    stepped a spent user down to — advice they cannot take until tomorrow.
+  //
+  // Restore it together with Flash leaving FREEBUFF_PREMIUM_MODEL_IDS, not
+  // before: the argument returns only when Flash is free again.
 } as const satisfies FreebuffModelOption
 
 const DEEPSEEK_V4_FLASH_MODEL = {
@@ -531,15 +806,93 @@ const DEEPSEEK_V4_FLASH_MODEL = {
   // date a returning user sees the same name and assumes the same model. The
   // 0731 GA build is a different, re-post-trained model.
   displayName: 'DeepSeek V4 Flash 07/31',
-  tagline: 'Smartest & Fastest',
+  // "Smart & Fast" survived Flash becoming premium on 2026-08-18: it describes
+  // the model, and the one word in it that described the TIER ("unlimited") had
+  // already gone when Pro took the recommendation on 2026-08-12. The picker
+  // renders the premium group heading, so the tagline does not have to.
+  tagline: 'Smart & Fast',
+  availability: 'always',
+  warning: FREEBUFF_AI_TRAINING_NOTICE,
+  dataUse: 'training',
+  // TEMPORARY (2026-08-18). Flash was the unlimited model every free account
+  // could run without touching the daily pool. It is metered by that pool now
+  // because it became the single largest driver of free-mode spend — the whole
+  // of DeepSeek's peak-hour repricing lands on it, and it carries far more
+  // traffic than any premium row. Unlimited is MiMo 2.5 while this holds.
+  //
+  // Reverting is this flag, its entry in FREEBUFF_PREMIUM_MODEL_IDS, and the
+  // FALLBACK_FREEBUFF_MODEL_ID / DEFAULT_FREEBUFF_MODEL_ID pair — all four move
+  // together or the catalog contradicts itself. See FREEBUFF_TIER_CHANGE_NOTICE
+  // for the copy that has to come down with them.
+  premium: true,
+  multimodal: false,
+  reasoningEffort: 'high',
+  // The 07/31 build has native low/high/max prompt templates. Medium is not a
+  // distinct level and is intentionally absent.
+  efforts: DEEPSEEK_V4_REASONING_EFFORTS,
+  defaultEffort: 'high',
+  isNew: true,
+} as const satisfies FreebuffModelOption
+
+/**
+ * The provisioned extended-context tiers.
+ *
+ * Full rows so the provisioning tooling, the usage ledger and support have a
+ * display name and a data-use classification to read, exactly like every other
+ * model. They are deliberately NOT in FREEBUFF_MODELS, FREEBUFF_WEB_MODELS or
+ * any quota list: the tier is granted per account rather than picked, so a
+ * client that rendered one would offer a row most accounts cannot run, and a
+ * quota list would meter a tier whose ceiling is the grant itself.
+ *
+ * Reasoning defaults, pricing and context tracking their base tier is the
+ * point of the suffix — it names the provisioned variant, not a new family.
+ */
+const DEEPSEEK_V4_PRO_MAX_MODEL = {
+  id: FREEBUFF_DEEPSEEK_V4_PRO_MAX_MODEL_ID,
+  displayName: 'DeepSeek V4 Pro (Max context)',
+  tagline: 'Extended context',
   availability: 'always',
   warning: FREEBUFF_AI_TRAINING_NOTICE,
   dataUse: 'training',
   premium: false,
   multimodal: false,
   reasoningEffort: 'high',
-  isNew: true,
+  defaultEffort: 'high',
 } as const satisfies FreebuffModelOption
+
+const DEEPSEEK_V4_FLASH_MAX_MODEL = {
+  id: FREEBUFF_DEEPSEEK_V4_FLASH_MAX_MODEL_ID,
+  displayName: 'DeepSeek V4 Flash (Max context)',
+  tagline: 'Extended context',
+  availability: 'always',
+  warning: FREEBUFF_AI_TRAINING_NOTICE,
+  dataUse: 'training',
+  premium: false,
+  multimodal: false,
+  reasoningEffort: 'high',
+  defaultEffort: 'high',
+} as const satisfies FreebuffModelOption
+
+const GPT_5_6_LUNA_MAX_MODEL = {
+  id: FREEBUFF_GPT_5_6_LUNA_MAX_MODEL_ID,
+  displayName: 'GPT-5.6 Luna (Max context)',
+  tagline: 'Extended context',
+  availability: 'always',
+  dataUse: 'service',
+  premium: true,
+  multimodal: false,
+  reasoningEffort: FREEBUFF_GPT_5_6_LUNA_REASONING_EFFORT,
+} as const satisfies FreebuffModelOption
+
+/**
+ * The provisioned tiers, as rows. Exported for the provisioning tooling and
+ * for support lookups; NOT spread into any catalog, for the reason above.
+ */
+export const FREEBUFF_PROVISIONED_MODELS = [
+  DEEPSEEK_V4_PRO_MAX_MODEL,
+  DEEPSEEK_V4_FLASH_MAX_MODEL,
+  GPT_5_6_LUNA_MAX_MODEL,
+] as const satisfies readonly FreebuffModelOption[]
 
 const MINIMAX_M3_MODEL = {
   id: FREEBUFF_MINIMAX_M3_MODEL_ID,
@@ -551,6 +904,8 @@ const MINIMAX_M3_MODEL = {
   // data-use classification keeps it out of FREEBUFF_TRACED_MODEL_IDS.
   premium: true,
   multimodal: true,
+  // MiniMax M3 supports adaptive thinking or disabled thinking, but no effort
+  // levels. A depth picker would therefore be cosmetic.
   // Flash overtook M3 on quality and is free rather than premium-pooled. M3
   // stays selectable — it is still the no-AI-training pick and natively
   // multimodal — but the picker says Flash is the better default.
@@ -564,7 +919,9 @@ const MINIMAX_M3_MODEL = {
 const GPT_5_6_LUNA_MODEL = {
   id: FREEBUFF_GPT_5_6_LUNA_MODEL_ID,
   displayName: 'GPT-5.6 Luna',
-  tagline: 'Thinks hard & Fast',
+  // Luna is the general-purpose premium option; its row's own badges (Images,
+  // no training notice) distinguish it from the other all-around models.
+  tagline: 'Strong all-around',
   availability: 'always',
   // OpenAI's API does not train on request data, and the route carries
   // data_collection: 'deny', so no AI-training notice and no trace storage
@@ -574,6 +931,21 @@ const GPT_5_6_LUNA_MODEL = {
   // OpenRouter reports input modalities text + image + file for this model.
   multimodal: true,
   reasoningEffort: FREEBUFF_GPT_5_6_LUNA_REASONING_EFFORT,
+  // OpenRouter's model metadata advertises all five enabled effort levels.
+  efforts: EFFORTS_THROUGH_MAX,
+  defaultEffort: FREEBUFF_GPT_5_6_LUNA_REASONING_EFFORT,
+  // Luna led the browser surfaces from 2026-08-04 until Pro's 08/13 GA build
+  // took the recommendation on 2026-08-12. It stays fully selectable, and stays
+  // the one premium row with no AI-training notice and native image input —
+  // reasons a user may still deliberately want it — but the picker now says
+  // plainly that Pro is the better default.
+  //
+  // NOT in FREEBUFF_WEB_DEEMPHASIZED_MODEL_IDS — which is now empty, but Luna
+  // would not qualify anyway: muting is this product's "materially dearer"
+  // signal, and against Pro that does not resolve — Pro is 2.76x cheaper on the cache reads that
+  // dominate agent traffic, and dearer on fresh input and output (full table on
+  // that constant). Steering on quality is honest; implying a settled price
+  // difference in either direction would not be.
 } as const satisfies FreebuffModelOption
 
 const GLM_V52_MODEL = {
@@ -588,69 +960,40 @@ const GLM_V52_MODEL = {
   // gate is its weekly referral-session pool, not the daily premium pool.
   premium: true,
   multimodal: false,
+  // Our CrofAI route accepts but ignores reasoning_effort (including invalid
+  // values), so OpenRouter's GLM ladder does not describe the route users run.
 } as const satisfies FreebuffModelOption
 
 /**
- * Greg 2 Ultra / Super, CrofAI. Both god-only, and the cost is why.
+ * Kimi K3 (Eco), CrofAI. God-only, for testing, and the cost is part of why.
  *
- * List price per M (CrofAI catalog, 2026-08-04):
+ * List price per M (CrofAI catalog, read from the live /v1/models endpoint on
+ * 2026-08-07): $1.00 in, $0.10 cache read, $4.00 out. Against DeepSeek V4
+ * Flash's $0.12/$0.21 on the same provider that is ~8x input and ~19x output,
+ * which is the argument for keeping it off the public picker rather than
+ * merely marking it premium.
  *
- *   greg-2-ultra   $3.00 in   $0.50 cache   $10.00 out
- *   greg-2-super   $1.50 in   $0.25 cache   $ 5.00 out
- *
- * Against DeepSeek V4 Flash's $0.14/$0.28 that is ~21x input and ~36x output
- * on Ultra. Worse, both carry a ~17,000-token hidden preamble upstream:
- * measured live, a bare "hi" billed 17,538 prompt tokens and $0.053 on Ultra
- * against $0.000017 for deepseek-v4-flash-0731 on the same request — roughly
- * 3,000x for the same user input. There is no request cheap enough to be
- * casual with, which is the whole argument for keeping these off the public
- * picker rather than merely marking them premium.
- *
- * Both are int4-quantized with a 229,376-token context, and both were verified
- * live to stream and to emit tool calls.
+ * `displayName` is 'Kimi K3', NOT 'Kimi K3 Eco', by explicit request. This
+ * breaks the convention DEEPSEEK_V4_FLASH_MODEL sets — name the exact build so
+ * a returning user cannot mistake one for another — and the divergence is
+ * deliberate rather than an oversight, so do not "fix" it: CrofAI also serves a
+ * full `kimi-k3` at twice the price, and this row is the Q2_K-quantized Eco
+ * build (1M context, 131,072 max completion tokens). The wire id keeps `-eco`
+ * so the two builds stay distinguishable everywhere it actually matters —
+ * routing, billing, and the CROF_MODEL_MAP entry. If the full K3 is ever added
+ * as its own row, this label has to be disambiguated at that point.
  */
-const GREG_2_ULTRA_MODEL = {
-  id: FREEBUFF_GREG_2_ULTRA_MODEL_ID,
-  displayName: 'Greg 2 Ultra',
+const KIMI_K3_ECO_MODEL = {
+  id: FREEBUFF_KIMI_K3_ECO_MODEL_ID,
+  displayName: 'Kimi K3',
   tagline: 'Via CrofAI',
   availability: 'always',
   dataUse: 'service',
   premium: true,
   multimodal: false,
   experimental: true,
-} as const satisfies FreebuffModelOption
-
-const GREG_2_SUPER_MODEL = {
-  id: FREEBUFF_GREG_2_SUPER_MODEL_ID,
-  displayName: 'Greg 2 Super',
-  tagline: 'Via CrofAI',
-  availability: 'always',
-  dataUse: 'service',
-  premium: true,
-  multimodal: false,
-  experimental: true,
-} as const satisfies FreebuffModelOption
-
-const POOLSIDE_LAGUNA_S_21_MODEL = {
-  id: FREEBUFF_POOLSIDE_LAGUNA_S_21_MODEL_ID,
-  displayName: 'Laguna S 2.1 (Poolside)',
-  tagline: 'Direct Poolside API',
-  availability: 'always',
-  dataUse: 'service',
-  premium: true,
-  multimodal: false,
-  experimental: true,
-} as const satisfies FreebuffModelOption
-
-const POOLSIDE_LAGUNA_S_21_OPENROUTER_MODEL = {
-  id: FREEBUFF_POOLSIDE_LAGUNA_S_21_OPENROUTER_MODEL_ID,
-  displayName: 'Laguna S 2.1 (OpenRouter)',
-  tagline: 'Paid via OpenRouter',
-  availability: 'always',
-  dataUse: 'service',
-  premium: true,
-  multimodal: false,
-  experimental: true,
+  // CrofAI likewise ignores reasoning_effort for this build. Do not expose a
+  // control until this concrete route reports distinct supported levels.
 } as const satisfies FreebuffModelOption
 
 const FABLE_5_MODEL = {
@@ -668,10 +1011,13 @@ const FABLE_5_MODEL = {
   // Not in FREEBUFF_PREMIUM_MODEL_IDS: the daily premium pool is shared across
   // its models and Fable is metered by its OWN global pool instead (see
   // FREEBUFF_LIMITED_OFFER_MODEL_IDS). The flag only marks it as scarce for the
-  // pickers' styling and for FREEBUFF_WEB_STANDARD_MODEL_IDS, which must not
+  // pickers' styling and for FREEBUFF_STANDARD_MODEL_IDS, which must not
   // absorb it.
   premium: true,
   multimodal: true,
+  // OpenRouter reports low/medium/high/xhigh/max, with high as the default.
+  efforts: EFFORTS_THROUGH_MAX,
+  defaultEffort: 'high',
   isNew: true,
 } as const satisfies FreebuffModelOption
 
@@ -698,20 +1044,9 @@ const MUSE_SPARK_12_CONTRIBUTOR_MODEL = {
   dataUse: 'training',
   premium: true,
   multimodal: false,
-} as const satisfies FreebuffModelOption
-
-const LING_3_FLASH_MODEL = {
-  id: FREEBUFF_LING_3_FLASH_MODEL_ID,
-  displayName: 'Ling 3.0 Flash',
-  tagline: 'Free via OpenRouter',
-  availability: 'always',
-  // OpenRouter's free endpoints route to providers that may retain and train
-  // on prompts, and the bundled agent opts into data_collection.
-  warning: FREEBUFF_AI_TRAINING_NOTICE,
-  dataUse: 'training',
-  premium: true,
-  multimodal: false,
-  experimental: true,
+  reasoningEffort: FREEBUFF_MUSE_SPARK_REASONING_EFFORT,
+  efforts: EFFORTS_THROUGH_XHIGH,
+  defaultEffort: FREEBUFF_MUSE_SPARK_REASONING_EFFORT,
 } as const satisfies FreebuffModelOption
 
 export const SUPPORTED_FREEBUFF_MODELS = [
@@ -735,19 +1070,127 @@ export const SUPPORTED_FREEBUFF_MODELS = [
 // now 403 with free_mode_invalid_agent_model. The non-Pro MiMo 2.5 is
 // unaffected, and paid/BYOK MiMo Pro plus its llm-api provider routing are
 // untouched.
+// Order is the order shown in every picker: the recommended default leads, the
+// unlimited fallback it steps down to follows, then the rest of the full-access
+// grid.
+//
+// DeepSeek V4 Pro is PAUSED for free mode (2026-08-18) and left this list — the
+// row is gone from every picker. It stays in SUPPORTED_FREEBUFF_MODELS on
+// purpose: released clients hold their catalog in the binary and keep asking for
+// it, and an id the server does not RECOGNISE cannot be coerced, only refused.
+// Recognising it is what lets admission substitute (see
+// FREEBUFF_PAUSED_FREE_MODEL_IDS) instead of wedging those clients the way
+// #1801 wedged the limited tier.
 export const FREEBUFF_MODELS = [
-  DEEPSEEK_V4_FLASH_MODEL,
-  DEEPSEEK_V4_PRO_MODEL,
   GPT_5_6_LUNA_MODEL,
+  DEEPSEEK_V4_FLASH_MODEL,
   MINIMAX_M3_MODEL,
   ...(FREEBUFF_ENABLE_MIMO_MODELS_IN_UI ? [MIMO_V25_MODEL] : []),
+  // LAST on purpose, and the only row placed by price rather than by quality.
+  // Pro is selectable and is nobody's recommendation: it spends the same daily
+  // session as Flash for several times the cost, so it sits where a user
+  // reaches it deliberately rather than by scanning from the top. It is NOT in
+  // FREEBUFF_WEB_DEEMPHASIZED_MODEL_IDS — that list renders a compact, muted
+  // row, and one muted row among full-size ones reads as broken rather than as
+  // de-emphasized (see the note on that constant). Ordering plus its
+  // supersededBy notice does the steering without that.
+  DEEPSEEK_V4_PRO_MODEL,
 ] as const satisfies readonly FreebuffModelOption[]
 
+// Flash joined this list on 2026-08-18 (TEMPORARY — see
+// DEEPSEEK_V4_FLASH_MODEL.premium). Pro never left it for long: it was pulled
+// from the catalog entirely that day and restored on 2026-08-19, because both
+// monitoring its cost and routing its provider require it to serve traffic.
+// What changed instead is that nothing recommends it — see its supersededBy and
+// its place at the end of FREEBUFF_MODELS.
 export const FREEBUFF_PREMIUM_MODEL_IDS = [
   FREEBUFF_MINIMAX_M3_MODEL_ID,
-  FREEBUFF_DEEPSEEK_V4_PRO_MODEL_ID,
+  FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID,
   FREEBUFF_GPT_5_6_LUNA_MODEL_ID,
+  FREEBUFF_DEEPSEEK_V4_PRO_MODEL_ID,
 ] as const
+
+/**
+ * The DeepSeek family, and the per-user daily ceiling on it.
+ *
+ * ONE session a day, on top of — not instead of — the shared premium pool. Both
+ * halves matter: the ceiling is what bounds DeepSeek specifically, and staying
+ * inside FREEBUFF_PREMIUM_MODEL_IDS is what makes that session also spend a
+ * premium unit, so picking DeepSeek costs a user the same quota as any other
+ * premium row plus its own scarcer allowance.
+ *
+ * DeepSeek is the largest line on the free-mode bill by a wide margin, and
+ * unlike every other row its price doubles for ten hours a day on the upstream's
+ * schedule rather than ours. A shared pool cannot express that: five sessions
+ * spent entirely on DeepSeek and five spent on MiniMax are the same number and
+ * very different bills.
+ *
+ * BOTH ids share the one allowance deliberately. Flash and Pro are the same
+ * upstream account and the same rate card, so metering them separately would
+ * hand out two DeepSeek sessions to anyone who alternated.
+ */
+export const FREEBUFF_DEEPSEEK_MODEL_IDS = [
+  FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID,
+  FREEBUFF_DEEPSEEK_V4_PRO_MODEL_ID,
+] as const
+
+export const FREEBUFF_DEEPSEEK_SESSION_LIMIT = 1
+export const FREEBUFF_DEEPSEEK_SESSION_PERIOD = FREEBUFF_PREMIUM_SESSION_PERIOD
+export const FREEBUFF_DEEPSEEK_SESSION_RESET_TIMEZONE =
+  FREEBUFF_PREMIUM_SESSION_RESET_TIMEZONE
+export const FREEBUFF_DEEPSEEK_SESSION_WINDOW_HOURS =
+  FREEBUFF_PREMIUM_SESSION_WINDOW_HOURS
+
+/** Suffix-tolerant, so a dated provider snapshot cannot dodge the ceiling. */
+export function isFreebuffDeepSeekModelId(
+  id: string | null | undefined,
+): boolean {
+  if (!id) return false
+  return FREEBUFF_DEEPSEEK_MODEL_IDS.some((modelId) =>
+    freebuffModelIdMatches(id, modelId),
+  )
+}
+
+/**
+ * Models free mode no longer runs, but still RECOGNISES.
+ *
+ * This is not a picker-only retirement (FREEBUFF_WEB_RETIRED_PICKER_MODEL_IDS
+ * is that, and is deliberately empty) — nothing here is served to anyone. It is
+ * the opposite problem: a paused model must stay a known id so the server can
+ * SUBSTITUTE for it.
+ *
+ * An id dropped from SUPPORTED entirely is one `isFreebuffSessionModelId` says
+ * nothing about, so the coercion in `resolveFreebuffSessionModelForAccessTier`
+ * never runs and the request is simply refused. Every installed client holding
+ * that pick then retries forever, because the pick comes from the catalog
+ * compiled into its binary and no server change reaches it — measured at 2.5x
+ * admissions and 91% of sessions ending at the 0.1-unit floor when the limited
+ * tier hit exactly this on 2026-08-18 (#1801).
+ *
+ * So: out of every picker, out of every quota list, still recognised, and
+ * coerced to the tier's default at admission and at the session gate.
+ *
+ * EMPTY as of 2026-08-19. V4 Pro was the only entry, for one day, and came
+ * back because monitoring its cost and routing its provider both need it to
+ * serve traffic — it is de-recommended instead (see its supersededBy).
+ *
+ * The machinery stays. It is the tested answer to a question that keeps coming
+ * up under cost pressure, and the expensive way to learn it is the one already
+ * paid for in #1801: the coercion has to exist BEFORE a model is taken away,
+ * because the clients that need it are the ones already installed.
+ */
+export const FREEBUFF_PAUSED_FREE_MODEL_IDS: readonly FreebuffModelId[] = []
+
+/** Suffix-tolerant like the other model predicates, so a dated provider
+ *  snapshot of a paused model cannot slip past the pause. */
+export function isFreebuffPausedFreeModelId(
+  id: string | null | undefined,
+): boolean {
+  if (!id) return false
+  return FREEBUFF_PAUSED_FREE_MODEL_IDS.some((modelId) =>
+    freebuffModelIdMatches(id, modelId),
+  )
+}
 
 // ---------------------------------------------------------------------------
 // Limited-offer models
@@ -813,11 +1256,7 @@ export const FREEBUFF_WEB_MODELS = [
 ] as const satisfies readonly FreebuffModelOption[]
 
 export const FREEBUFF_WEB_GOD_ONLY_MODELS = [
-  LING_3_FLASH_MODEL,
-  POOLSIDE_LAGUNA_S_21_MODEL,
-  POOLSIDE_LAGUNA_S_21_OPENROUTER_MODEL,
-  GREG_2_ULTRA_MODEL,
-  GREG_2_SUPER_MODEL,
+  KIMI_K3_ECO_MODEL,
 ] as const satisfies readonly FreebuffModelOption[]
 
 export const FREEBUFF_WEB_ALL_MODELS = [
@@ -826,11 +1265,7 @@ export const FREEBUFF_WEB_ALL_MODELS = [
 ] as const satisfies readonly FreebuffModelOption[]
 
 export const FREEBUFF_WEB_GOD_ONLY_MODEL_IDS = [
-  FREEBUFF_LING_3_FLASH_MODEL_ID,
-  FREEBUFF_POOLSIDE_LAGUNA_S_21_MODEL_ID,
-  FREEBUFF_POOLSIDE_LAGUNA_S_21_OPENROUTER_MODEL_ID,
-  FREEBUFF_GREG_2_ULTRA_MODEL_ID,
-  FREEBUFF_GREG_2_SUPER_MODEL_ID,
+  FREEBUFF_KIMI_K3_ECO_MODEL_ID,
 ] as const
 
 /**
@@ -874,25 +1309,33 @@ export function isFreebuffWebSelectableModelId(
  *  any GLM route in this list hands the model out for nothing. */
 export const FREEBUFF_WEB_PREMIUM_MODEL_IDS = [
   ...FREEBUFF_PREMIUM_MODEL_IDS,
-  FREEBUFF_POOLSIDE_LAGUNA_S_21_MODEL_ID,
-  FREEBUFF_POOLSIDE_LAGUNA_S_21_OPENROUTER_MODEL_ID,
-  FREEBUFF_LING_3_FLASH_MODEL_ID,
   // Metered by the web premium pool like every other god-only row. Being in
-  // SOME pool is the point: FREEBUFF_WEB_STANDARD_MODEL_IDS is derived by
+  // SOME pool is the point: FREEBUFF_STANDARD_MODEL_IDS is derived by
   // filtering `!premium`, so a premium model left out of here would be metered
   // by no pool at all rather than by a stricter one.
-  FREEBUFF_GREG_2_ULTRA_MODEL_ID,
-  FREEBUFF_GREG_2_SUPER_MODEL_ID,
+  FREEBUFF_KIMI_K3_ECO_MODEL_ID,
   // Not here for cost — Muse Spark Contributor is cheaper per token than the
   // Standard pool's models. The premium pool is what bounds how many users sit
   // inside its 60 RPM team-wide ceiling at once, and being in SOME pool is
-  // mandatory: FREEBUFF_WEB_STANDARD_MODEL_IDS is derived by filtering
+  // mandatory: FREEBUFF_STANDARD_MODEL_IDS is derived by filtering
   // `!premium`, so a premium model left out of here is metered by no pool.
   FREEBUFF_MUSE_SPARK_12_CONTRIBUTOR_MODEL_ID,
 ] as const
 
-/** Full-access Web/Cloud models sharing the browser-only standard daily pool. */
-export const FREEBUFF_WEB_STANDARD_MODEL_IDS = Object.freeze(
+/**
+ * Full-access models outside the premium and referral pools — i.e. the ones a
+ * full-access account may use without a session quota at all, on every
+ * surface.
+ *
+ * Derived by filtering `!premium` over the public catalog, which is why the
+ * premium lists above insist that every premium model appear in SOME pool: a
+ * premium model left out of them lands in here and becomes unlimited.
+ *
+ * Named `WEB_STANDARD` until 2026-08-18, when the browser-only session pool it
+ * was named after was removed; the list itself is unchanged and is now the
+ * catalog invariant several tests assert against.
+ */
+export const FREEBUFF_STANDARD_MODEL_IDS = Object.freeze(
   FREEBUFF_WEB_ALL_MODELS.filter((model) => !model.premium).map(
     (model) => model.id,
   ),
@@ -1036,38 +1479,60 @@ export type FreebuffWebModelId = (typeof FREEBUFF_WEB_ALL_MODELS)[number]['id']
 export type FreebuffWebPremiumModelId =
   (typeof FREEBUFF_WEB_PREMIUM_MODEL_IDS)[number]
 
-/** What new freebuff users see selected in the picker. DeepSeek V4 Flash as of
- *  2026-07-31: the V4-Flash-0731 GA build re-post-trained for agent work now
- *  beats V4 Pro on the coding/tool-use benchmarks that matter here, at a
- *  fraction of the per-token cost — so the strongest pick and the cheapest pick
- *  are the same model. It is also always-available and outside the premium
- *  pool, which means the recommended default no longer has to flip when the
- *  pool runs out. (It does still carry the AI-training notice, so pickers using
- *  this default must render the model's `warning`.)
- *  Callers that need a guaranteed-available id for resolution /
- *  auto-fallbacks should use FALLBACK_FREEBUFF_MODEL_ID instead (same model
- *  today, but the two are separate decisions). */
+/** What new freebuff users see selected in the CLI and Desktop pickers, and the
+ *  model their "RECOMMENDED" hero opens on. DeepSeek V4 Flash 07/31 as of
+ *  2026-08-18, taking back the lead it held until 2026-08-12, because V4 Pro —
+ *  which took it on the strength of the 08/13 GA build — is paused for free mode
+ *  (FREEBUFF_PAUSED_FREE_MODEL_IDS). Flash is the strongest row free mode still
+ *  runs, so it leads again by default rather than by re-argued merit.
+ *
+ *  It is PREMIUM as of the same day, which it was NOT the last time it held this
+ *  slot, so the machinery below is now load-bearing for it too: the shared daily
+ *  pool CAN run dry, and surfaces that know the live quota must step down to
+ *  FALLBACK_FREEBUFF_MODEL_ID once it is spent — getRecommendedFreebuffModelId
+ *  for the picker hero, Desktop's availableFreebuffDefault for an unpicked tab —
+ *  or the default becomes a model whose next send fails admission.
+ *
+ *  Still three separate constants: this one, DEFAULT_FREEBUFF_WEB_MODEL_ID and
+ *  FALLBACK_FREEBUFF_MODEL_ID (what callers needing a guaranteed-available id
+ *  for resolution / auto-fallbacks should use). The first two name the same
+ *  model today and have diverged before; the third is genuinely a different
+ *  model rather than the same one under two names.
+ *
+ *  It carries the AI-training notice, so pickers using it must render the
+ *  model's `warning`. */
 export const DEFAULT_FREEBUFF_MODEL_ID: FreebuffModelId =
-  FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID
+  FREEBUFF_GPT_5_6_LUNA_MODEL_ID
 
 /** What new Freebuff Web/Cloud users see selected in the browser pickers, and
- *  the model a new Cloud thread starts on. GPT-5.6 Luna as of 2026-08-04.
+ *  the model a new Cloud thread starts on. DeepSeek V4 Flash 07/31 as of
+ *  2026-08-18, because V4 Pro — which held this from 2026-08-12 — is paused for
+ *  free mode (FREEBUFF_PAUSED_FREE_MODEL_IDS).
  *
- *  A browser build is the workload where model quality shows up most — it is
- *  one long agentic run against a live sandbox, and a wrong turn early costs
- *  the whole first project, which 51% of Web users never come back from. Luna
- *  is also `dataUse: 'service'`, so the model a brand-new user lands on no
- *  longer carries an AI-training notice.
+ *  A browser build is the workload where model quality shows up most: one long
+ *  agentic run against a live sandbox, where a wrong turn early costs the whole
+ *  first project, which 51% of Web users never come back from. That argument
+ *  picked Pro and it has not changed — Pro is simply not available to spend on
+ *  right now, so this falls to the strongest row free mode still runs.
  *
- *  It is premium, so it draws on the shared daily pool. Surfaces that know the
- *  live quota must step down to FALLBACK_FREEBUFF_MODEL_ID once that pool is
- *  spent (getRecommendedFreebuffWebModelId does this for the hero picker, and
- *  the model selector coerces a spent default) — otherwise the default becomes
- *  a model whose next send fails admission.
+ *  The cost half had ALREADY collapsed before the pause, which is why this is a
+ *  smaller loss than it looks. Browser turns re-send their whole prefix every
+ *  step, so cache reads are ~98% of tokens; Pro read cache at $0.003625/M
+ *  against Luna's $0.010/M until DeepSeek's 16:00 UTC 2026-08-16 repricing put
+ *  it at $0.022/M off-peak and $0.044/M at peak — 2.2x to 4.4x DEARER than Luna
+ *  on the dominant term, on top of fresh input and output. See
+ *  FREEBUFF_WEB_DEEMPHASIZED_MODEL_IDS for the table.
+ *
+ *  Flash keeps the AI-training notice Pro carried, so the disclosure a
+ *  first-time user sees is unchanged. It is premium as of 2026-08-18, so it
+ *  still draws on the shared daily pool and the step-down to
+ *  FALLBACK_FREEBUFF_MODEL_ID stays load-bearing (getRecommendedFreebuffWebModelId
+ *  for the hero picker; the model selector coerces a spent default) — otherwise
+ *  the default becomes a model whose next send fails admission.
  *
  *  Kept as its own constant from DEFAULT_FREEBUFF_MODEL_ID (CLI/Desktop) so the
- *  browser surfaces can steer independently: the CLI stays on Flash, where
- *  turns are short, cheap and far more numerous. */
+ *  browser surfaces can steer independently. They name the same model today and
+ *  diverged as recently as 2026-08-04 → 2026-08-12. */
 export const DEFAULT_FREEBUFF_WEB_MODEL_ID: FreebuffWebModelId =
   FREEBUFF_GPT_5_6_LUNA_MODEL_ID
 
@@ -1077,13 +1542,42 @@ export const DEFAULT_FREEBUFF_WEB_MODEL_ID: FreebuffWebModelId =
  *  fully selectable — this only controls emphasis and ordering (they sort last
  *  within the Premium group).
  *
- *  Since 2026-07-31 this is exactly the set of models Flash superseded: both
- *  cost more per token AND lost the quality argument, so muting them and
- *  sorting them last is what steers new picks to Flash. */
-export const FREEBUFF_WEB_DEEMPHASIZED_MODEL_IDS = [
-  FREEBUFF_MINIMAX_M3_MODEL_ID,
-  FREEBUFF_DEEPSEEK_V4_PRO_MODEL_ID,
-] as const
+ *  This tracks the models Flash superseded — costing more per token AND having
+ *  lost the quality argument — so muting them is what steers new picks to Flash.
+ *  Both halves of that test have to hold: DeepSeek V4 Pro left this list on
+ *  2026-08-12 because its 08/13 GA build wins the quality half again.
+ *
+ *  EMPTY as of 2026-08-12. MiniMax M3 was the last entry, and with Pro gone it
+ *  was the only muted row in a list of full-size ones — the compact treatment
+ *  folds the tagline up onto the name line, which next to four two-line rows
+ *  read as a broken row rather than as a de-emphasized one. M3 keeps its
+ *  supersededBy notice, which is the steering that was doing the real work.
+ *  Muting only pays for itself on a group of rows, so add entries back in
+ *  pairs or not at all.
+ *
+ *  GPT-5.6 Luna is superseded (by Pro) and deliberately NOT muted. The cost
+ *  half of that call used to be genuinely unresolvable; DeepSeek's 16:00 UTC
+ *  2026-08-16 repricing resolved it the other way. Per M — Luna read off
+ *  OpenRouter 2026-08-12, Pro from DeepSeek's published card:
+ *
+ *                    fresh input   cache read   output
+ *    V4 Pro off-peak    $0.660       $0.022      $1.980
+ *    V4 Pro peak        $1.320       $0.044      $3.960
+ *    Luna               $0.100       $0.010      $0.600
+ *
+ *  Pro was 2.76x cheaper than Luna on cache reads — the term that dominates an
+ *  agent workload, where re-sent prefixes are ~98% of tokens. It is now 2.2x
+ *  dearer off-peak and 4.4x dearer at peak, and it was already dearer on fresh
+ *  input and output. So Pro is now dearer than Luna on every term in every
+ *  window, and "materially more expensive" is a claim that has moved onto the
+ *  OTHER row.
+ *
+ *  This list is still EMPTY and Pro is still the Web default — muting is a
+ *  product-steering decision and the repricing alone should not silently flip
+ *  it. But the numbers that justified both no longer say what they said; this
+ *  is the note for whoever revisits it. */
+export const FREEBUFF_WEB_DEEMPHASIZED_MODEL_IDS: readonly FreebuffModelId[] =
+  []
 
 export function isFreebuffWebDeemphasizedModelId(
   id: string | null | undefined,
@@ -1095,18 +1589,40 @@ export function isFreebuffWebDeemphasizedModelId(
 }
 
 /** Always-available fallback used when the requested model can't be served
- *  right now (unknown id, deployment hours closed, etc.). Kept distinct from
- *  DEFAULT_FREEBUFF_MODEL_ID so a new user's "preferred default" can be the
- *  smartest model without auto-flipping anyone to a closed serverless model. */
+ *  right now (unknown id, deployment hours closed, premium pool spent). Kept
+ *  distinct from DEFAULT_FREEBUFF_MODEL_ID so a new user's "preferred default"
+ *  can be the smartest model without auto-flipping anyone to a closed
+ *  serverless model.
+ *
+ *  MUST BE NON-PREMIUM. This is the id every surface steps down TO when the
+ *  daily premium pool runs dry, so a premium value here is a step-down onto a
+ *  model that fails admission for exactly the user it was meant to rescue — a
+ *  loop, not a fallback. That is why it moved off Flash on 2026-08-18 the same
+ *  hour Flash became premium: the two edits are one change, and restoring
+ *  either alone re-creates the loop.
+ *
+ *  MiMo 2.5 is now the only unlimited row in the catalog, so it is both this
+ *  fallback and LIMITED_FREEBUFF_MODEL_ID. Those coinciding is a consequence of
+ *  the pause, not a rule — keep them separate constants. */
 export const FALLBACK_FREEBUFF_MODEL_ID: FreebuffModelId =
-  FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID
+  FREEBUFF_MIMO_V25_MODEL_ID
 
+/**
+ * The limited tier's catalog, and the model an out-of-tier or stale pick is
+ * coerced to. MiMo 2.5 alone since 2026-08-18: DeepSeek V4 Flash 07/31 was this
+ * tier's default until DeepSeek repriced the V4 family on 2026-08-16 (see
+ * DEEPSEEK_V4_PRO_MODEL), and it is the tier's highest-volume model, so pausing
+ * it here is what keeps these sessions free.
+ *
+ * A PAUSE, NOT A RETIREMENT. Flash stays in SUPPORTED_FREEBUFF_MODELS,
+ * FREEBUFF_MODELS and FALLBACK_FREEBUFF_MODEL_ID, so full access is unaffected
+ * and restoring it is re-adding the id here (and to
+ * FREEBUFF_WEB_GEO_EXEMPT_MODEL_IDS) plus dropping
+ * FREEBUFF_PAUSED_MODEL_NOTICE from the pickers.
+ */
 export const LIMITED_FREEBUFF_MODEL_ID: FreebuffModelId =
-  FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID
-export const LIMITED_FREEBUFF_MODEL_IDS = [
-  FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID,
-  FREEBUFF_MIMO_V25_MODEL_ID,
-] as const
+  FREEBUFF_MIMO_V25_MODEL_ID
+export const LIMITED_FREEBUFF_MODEL_IDS = [FREEBUFF_MIMO_V25_MODEL_ID] as const
 export const LIMITED_FREEBUFF_MODELS = LIMITED_FREEBUFF_MODEL_IDS.map(
   (modelId) => SUPPORTED_FREEBUFF_MODELS.find((model) => model.id === modelId)!,
 )
@@ -1118,16 +1634,66 @@ export type FreebuffAccessTier = 'full' | 'limited'
  *  loads, but every agent send is rejected server-side. */
 export type FreebuffWebAccessTier = FreebuffAccessTier | 'blocked'
 
-/** Temporary project-creation cap for outer-region (limited-tier) Freebuff Web
- *  users. A new project consumes one slot; the quota resets at midnight
- *  Pacific time. */
-export const FREEBUFF_WEB_LIMITED_PROJECT_DAILY_LIMIT = 3
+/** How many of a user's projects may have an agent RUNNING at the same time on
+ *  Freebuff Web/Cloud. Past the cap the take-over prompt appears, and taking
+ *  over stops only the longest-idle run.
+ *
+ *  STILL 1 — and raising it is a one-line change here ONLY once Freebuff Web is
+ *  on the per-tab (multi-session) free-session store. On the single-session
+ *  store the web surface uses today, `admitOrTakeOver` rotates
+ *  `active_instance_id` on EVERY `requestSession`, including a same-model live
+ *  reclaim (web/src/server/free-session/store.ts). So the moment a second
+ *  project admitted its session, the first project's in-flight turn would fail
+ *  its next completions call with `session_superseded` — concurrency that
+ *  silently kills the run the user is watching. Desktop already runs concurrent
+ *  per-tab sessions via `requestSession({ multiSession, instanceId })`; wiring
+ *  Web to the same path (session request header + `freebuff_multi_session` in
+ *  the runner's `codebuff_metadata`) is what unblocks 2.
+ *
+ *  Everything else is already cap-agnostic: rows are per (user, project) and
+ *  only `agent_running` ones count, so opening or reading a second project is
+ *  free at any cap — that part shipped 2026-08-12. */
+export const FREEBUFF_MAX_CONCURRENT_PROJECTS = 1
+
+/** Abuse backstop on project creation for outer-region (limited-tier) Freebuff
+ *  Web users. A project the user still has consumes one slot — creations that
+ *  failed and were rolled back do not, so a bad creation never costs quota.
+ *  The quota resets at midnight Pacific time.
+ *
+ *  This was 3 until 2026-08-12, which real users hit on their first session:
+ *  every rung of the creation ladder (warm pool → cold Daytona → browser
+ *  runtime) mints its own project row, so a couple of failed first builds
+ *  locked someone out for the day with nothing to show for it. 10 is high
+ *  enough that only automation reaches it. */
+/** Per-day cap on new Web projects a user may create, in EVERY region.
+ *
+ *  Was 10 and limited-region only until 2026-08-19, when the Daytona US quota
+ *  saturated (498/500 vCPU, 996/1000 GiB). Measured against a full day of
+ *  traffic at the time — 1,893 user-owned creations across 1,484 users, mean
+ *  1.3 — a cap of 5 would have blocked 41 creations (2.2%) across 11 users,
+ *  and the single heaviest account created 14. So this bounds the worst case
+ *  rather than reclaiming capacity; the routing change that moved
+ *  limited-region desktops to Nodepod is what actually moved the number.
+ *
+ *  Override per deployment with FREEBUFF_WEB_PROJECT_DAILY_LIMIT. */
+export const FREEBUFF_WEB_PROJECT_DAILY_LIMIT = 5
+
+/** How many of a user's sandboxes may be running at once. A sandbox counts as
+ *  open while its project has an agent run in flight or has proven presence
+ *  inside Daytona's 10-minute auto-stop window.
+ *
+ *  Set to the highest concurrency any single account was actually observed
+ *  holding on 2026-08-19 (2, across just 12 of ~1,485 daily-active owners), so
+ *  it binds nobody today and only stops that number growing.
+ *
+ *  Override per deployment with FREEBUFF_WEB_MAX_OPEN_SANDBOXES. */
+export const FREEBUFF_WEB_MAX_OPEN_SANDBOXES = 2
 
 /** Per-day cap on blank ("plan a custom stack") Cloud projects, which unlike
- *  connect-repo need no GitHub App install and each boot a full-size VM. The
- *  shared burst bucket alone would permit roughly ten in a row. Resets at
- *  midnight Pacific time. */
-export const FREEBUFF_CLOUD_BLANK_PROJECT_DAILY_LIMIT = 5
+ *  connect-repo need no GitHub App install and each boot a full-size VM. Same
+ *  backstop role — and the same rollback exemption — as the web limit above.
+ *  Resets at midnight Pacific time. */
+export const FREEBUFF_CLOUD_BLANK_PROJECT_DAILY_LIMIT = 10
 
 /** Per-project ceiling on custom-stack planner turns.
  *
@@ -1146,9 +1712,11 @@ export const FREEBUFF_CLOUD_BLANK_PROJECT_DAILY_LIMIT = 5
 export const FREEBUFF_CLOUD_PLANNER_TURN_LIMIT = 12
 
 /** Models available to limited-region Freebuff Web users. They share the
- * limited-region session pool; every other model remains geo-gated. */
+ * limited-region session pool; every other model remains geo-gated.
+ *
+ * Flash left this list with LIMITED_FREEBUFF_MODEL_IDS — restore it in both or
+ * neither, since FREEBUFF_WEB_LIMITED_MODEL_IDS is the union of the two. */
 export const FREEBUFF_WEB_GEO_EXEMPT_MODEL_IDS = [
-  FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID,
   FREEBUFF_MIMO_V25_MODEL_ID,
 ] as const
 
@@ -1183,7 +1751,8 @@ export function isFreebuffWebModelAllowedForLimitedTier(
 }
 
 /** Coerce a limited-tier Freebuff Web selection (premium ids, stale
- * localStorage values) to the allowed default (DeepSeek V4 Flash). */
+ * localStorage values — including a Flash pick saved before that model was
+ * paused for this tier) to LIMITED_FREEBUFF_MODEL_ID. */
 export function resolveFreebuffWebModelForLimitedTier(
   id: string | null | undefined,
 ): string {
@@ -1199,13 +1768,15 @@ export function getFreebuffModelsForAccessTier(
   return FREEBUFF_MODELS
 }
 
-/** The model the picker highlights as the "recommended" hero so a new user can
- *  start with one Enter press without scanning the full list. Full access →
- *  DeepSeek V4 Pro (the smartest default — a premium model in the
- *  shared daily pool); limited → the always-available flash model. Pass
- *  `premiumExhausted` from the live quota snapshot so the hero flips to the
- *  unlimited DeepSeek Flash once the premium pool runs out — the recommended
- *  pick must always be joinable. */
+/** The model the CLI/Desktop picker highlights as the "recommended" hero so a
+ *  new user can start with one Enter press without scanning the full list. Full
+ *  access → DEFAULT_FREEBUFF_MODEL_ID (DeepSeek V4 Pro 08/13 — the strongest
+ *  agentic model in the catalog); limited → LIMITED_FREEBUFF_MODEL_ID.
+ *
+ *  Pro is premium, so ALWAYS pass `premiumExhausted` from the live quota
+ *  snapshot: the hero flips to the unlimited DeepSeek Flash once the daily pool
+ *  runs out, because the recommended pick has to stay joinable. A caller that
+ *  omits it will offer a hero whose next send fails admission. */
 export function getRecommendedFreebuffModelId(
   accessTier: FreebuffAccessTier | null | undefined,
   options: { premiumExhausted?: boolean } = {},
@@ -1216,8 +1787,8 @@ export function getRecommendedFreebuffModelId(
 }
 
 /** The Web/Cloud counterpart of getRecommendedFreebuffModelId: full access →
- *  DeepSeek V4 Pro (the cost-efficient browser default); limited → the
- *  always-available flash model. `premiumExhausted` flips the hero to the
+ *  DEFAULT_FREEBUFF_WEB_MODEL_ID (GPT-5.6 Luna); limited →
+ *  LIMITED_FREEBUFF_MODEL_ID. `premiumExhausted` flips the hero to the
  *  unlimited flash model so the recommended pick is always joinable. */
 export function getRecommendedFreebuffWebModelId(
   accessTier: FreebuffAccessTier | null | undefined,
@@ -1282,6 +1853,11 @@ export function isFreebuffSessionModelAllowedForAccessTier(
   accessTier: FreebuffAccessTier | null | undefined,
 ): boolean {
   if (!model) return false
+  // A paused model is allowed to NO tier. Checked ahead of everything else
+  // because the pause is the whole point: it is still a recognised session id
+  // (see FREEBUFF_PAUSED_FREE_MODEL_IDS), so every other branch here would
+  // happily admit it.
+  if (isFreebuffPausedFreeModelId(model)) return false
   if (accessTier !== 'limited') return isFreebuffSessionModelId(model)
   // See isGlmRedeemableAtLimitedTier: GLM's limited-tier gate is the quota
   // pool (bounty grants only), not this allowlist.
@@ -1370,6 +1946,21 @@ export function resolveFreebuffSessionModelForAccessTier(
       ? (id as SupportedFreebuffModelId)
       : LIMITED_FREEBUFF_MODEL_ID
   }
+  // A paused pick coerces on the FULL tier too. This is the branch that keeps
+  // released clients working: their catalog is compiled in, so they go on
+  // asking for a paused model indefinitely, and coercing here means admission
+  // puts the row on a model that runs. Without it the pick falls through
+  // `isSupportedFreebuffModelId` — paused models are still supported — and
+  // admits a session on a model nothing will serve.
+  //
+  // To the FALLBACK, not to DEFAULT_FREEBUFF_MODEL_ID, and the difference is
+  // load-bearing now that the default is premium: coercing onto a premium model
+  // would spend a pool unit on a model the user never picked, and would fail
+  // outright for anyone whose pool is already spent — precisely the users least
+  // able to absorb it. The fallback is the only always-available target, which
+  // is the same reason the limited tier substitutes its own always-available
+  // model rather than its nicest one.
+  if (isFreebuffPausedFreeModelId(id)) return FALLBACK_FREEBUFF_MODEL_ID
   if (isSupportedFreebuffModelId(id)) return id
   return resolveFreebuffWebModel(id, {
     includeGodOnly: options.includeGodOnly ?? true,
@@ -1483,12 +2074,95 @@ export function isFreebuffGpt56LunaModelId(
 /** The catalog's reasoning effort for the requested model, tolerating dated
  *  snapshot suffixes like every other id helper. Null for models that carry
  *  none — see FreebuffModelOption.reasoningEffort. */
+/** The catalog row for any surface's id, or undefined. Both catalogs, for the
+ *  same reason getFreebuffModelReasoningEffort reads both: a Web-only model is
+ *  absent from SUPPORTED_FREEBUFF_MODELS by design. */
+function findFreebuffModelOption(
+  id: string | null | undefined,
+): FreebuffModelOption | undefined {
+  return (
+    SUPPORTED_FREEBUFF_MODELS.find((m) => freebuffModelIdMatches(id, m.id)) ??
+    FREEBUFF_WEB_ALL_MODELS.find((m) => freebuffModelIdMatches(id, m.id))
+  )
+}
+
+/** The ladder a user may pick from for this model, or null when it offers no
+ *  choice — which is every model that has not opted in. */
+export function getFreebuffModelEfforts(
+  id: string | null | undefined,
+): readonly ReasoningEffort[] | null {
+  const efforts = findFreebuffModelOption(id)?.efforts
+  return efforts && efforts.length > 0 ? efforts : null
+}
+
+/** Where this model's ladder starts before a user touches it. */
+export function getFreebuffModelDefaultEffort(
+  id: string | null | undefined,
+): ReasoningEffort | null {
+  const entry = findFreebuffModelOption(id)
+  if (!entry?.efforts?.length) return null
+  return entry.defaultEffort ?? entry.efforts[entry.efforts.length - 1]!
+}
+
+/**
+ * THE authority on what effort a request runs at. Everything a client sends is
+ * a request, never a command.
+ *
+ * Keyed on the model the request will ACTUALLY run — not the one the user
+ * picked. Those differ more often than they look: a limited-tier user's premium
+ * pick is coerced (resolveFreebuffSessionModelForAccessTier), the cloud build
+ * path rewrites it, and a Muse Spark turn can be rerouted to Luna mid-flight.
+ * Clamping against the requested model would then let one model's rung reach
+ * another's API — `xhigh` landing on DeepSeek maps to `max`, the most expensive
+ * rung there is, from a user who never asked for it.
+ *
+ * Clamp-DOWN (see clampReasoningEffort): a rung above the ceiling becomes the
+ * ceiling rather than snapping back to the default, so a rerouted user keeps
+ * the closest thing to what they chose. Models with no ladder return null and
+ * keep whatever `reasoningEffort` already says.
+ */
+export function resolveFreebuffReasoningEffort(
+  modelId: string | null | undefined,
+  requested: unknown,
+): ReasoningEffort | null {
+  const efforts = getFreebuffModelEfforts(modelId)
+  if (!efforts) return null
+  const fallback = getFreebuffModelDefaultEffort(modelId)
+  if (!fallback) return null
+  // Medium was briefly offered for Flash before the 07/31 capability matrix was
+  // corrected, and reaches these models from persisted Desktop/Web preferences
+  // and from threads that switched model. DeepSeek maps that compatibility
+  // spelling to high (medium→high in its own effort table), so honor that rather
+  // than letting generic clamp-down turn a stale value into LOW while the UI
+  // displays high.
+  //
+  // Applies to Pro as well as Flash since Pro's 08/13 ladder gained `low`:
+  // before that, "everything on offer is above medium" already landed Pro's
+  // medium on high, and losing that to the clamp would be a silent downgrade of
+  // exactly the model users pick for deliberation.
+  if (
+    requested === 'medium' &&
+    (freebuffModelIdMatches(modelId, FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID) ||
+      freebuffModelIdMatches(modelId, FREEBUFF_DEEPSEEK_V4_PRO_MODEL_ID))
+  ) {
+    return 'high'
+  }
+  return clampReasoningEffort(requested, efforts, fallback)
+}
+
 export function getFreebuffModelReasoningEffort(
   id: string | null | undefined,
 ): NonNullable<FreebuffModelOption['reasoningEffort']> | null {
-  const entry: FreebuffModelOption | undefined = SUPPORTED_FREEBUFF_MODELS.find(
-    (m) => freebuffModelIdMatches(id, m.id),
-  )
+  // BOTH catalogs, and the Web one is not optional. This used to read
+  // SUPPORTED_FREEBUFF_MODELS alone — the CLI/Desktop catalog — which silently
+  // excluded every Web-only model. Muse Spark is deliberately absent from that
+  // list (its absence IS the Desktop gate), so setting `reasoningEffort` on its
+  // row did nothing at all and gave no hint why: the field was present, the
+  // lookup simply could not see the row. Any future Web-only model would have
+  // hit the same wall.
+  const entry: FreebuffModelOption | undefined =
+    SUPPORTED_FREEBUFF_MODELS.find((m) => freebuffModelIdMatches(id, m.id)) ??
+    FREEBUFF_WEB_ALL_MODELS.find((m) => freebuffModelIdMatches(id, m.id))
   return entry?.reasoningEffort ?? null
 }
 
@@ -1514,8 +2188,8 @@ export function isFreebuffWebRememberableModelId(
 
 /**
  * The model a surface should START on, given a remembered (localStorage)
- * selection: the saved model when it is still valid and rememberable, else the
- * Web/Cloud default (DeepSeek V4 Pro).
+ * selection: the saved model when it is still valid and rememberable, else
+ * DEFAULT_FREEBUFF_WEB_MODEL_ID.
  *
  * Distinct from resolveFreebuffWebModel, which resolves a LIVE selection and
  * must leave a just-picked GLM alone.
@@ -1732,7 +2406,15 @@ export function isFreebuffSessionModelAvailable(
   const model =
     SUPPORTED_FREEBUFF_MODELS.find((candidate) => candidate.id === id) ??
     getFreebuffWebModel(id)
-  return model.availability === 'always' || isFreebuffDeploymentHours(now)
+  if (model.availability === 'always') return true
+  // Closed for the ten hours DeepSeek charges double (00:00-10:00 UTC). A
+  // separate mode from `deployment_hours`, which tracks OUR staffing rather
+  // than an upstream rate card, and the two windows are unrelated — collapsing
+  // them would silently move one when the other changed.
+  if (model.availability === 'off_peak_only') {
+    return !isDeepSeekExpensiveWindow(now)
+  }
+  return isFreebuffDeploymentHours(now)
 }
 
 export function resolveAvailableFreebuffModel(

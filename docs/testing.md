@@ -338,3 +338,106 @@ need rewriting to assert ordering rather than absence.
 
 The weekly `flake-hunt.yml` workflow runs this against `freebuff-desktop` and
 reports failures without blocking any PR.
+
+**A sixth shape, and the only one the hunt cannot reproduce: the budget bun
+applies to a HOOK.** `beforeEach`/`afterEach` are charged against the same
+default a test gets (5s), and one that overruns is reported as a failing *test*
+— `a beforeEach/afterEach hook timed out for this test` — so the case named is
+never the case at fault, and the file's first test is what takes the hit. On
+2026-08-11 that failed main: `engine-lifecycle`'s `beforeEach`, 3.7ms on a
+laptop and 28ms on the retry, took 5.313s on a stalled runner and failed
+`dispose > closes only this engine instance terminal scope`, a test that asserts
+one recorded call. Three overlapping suite runs under four CPU hogs never
+reproduced it, because there is nothing in the test to reproduce: the hook opens
+a real sqlite database and `rm -rf`s it again, and its latency is the machine's.
+Every hook in this package that builds a real fixture (`makeDb`, `makeRepo`,
+`makeEngine`, and worktree.test.ts's inline equivalent — 23 files) now carries
+`FIXTURE_HOOK_MS` from `test/support/budgets.ts`; the tests themselves keep the
+5s default, and a hook that is genuinely stuck still fails at the step timeout.
+The line is cost, not the helper: measured per hook pair, `makeRepo` is 77ms and
+`makeDb`/`makeEngine` 4.7ms, against 0.1ms for the 60-odd hooks that only
+`mkdtemp` and `rm -rf`. The stall that reddened main inflated a hook ~190x (and
+the test after it ~42x, which is why it reads as contention decaying rather than
+one fixed pause); at 0.1ms you would need ~10,000x, so those are left alone.
+
+That flake also cost more to find than to fix, which is its own lesson: a suite
+that fails and then passes leaves the failing attempt's output buried above the
+passing one, and `nick-fields/retry` reports only a count. `test-with-guard`
+therefore appends each attempt's failing test names to a file under the runner's
+`$RUNNER_TEMP`, and ci.yml's flake annotation names them. Before that,
+identifying the one `(fail)` line meant reading an 11,014-line log.
+`scripts/ci/bun-test-failures.ts` parses the names back out of bun's output,
+including the `^ …` reason line, and derives that path at both ends rather than
+having ci.yml pass it: `${{ runner.temp }}` is not available in a job-level
+`env:`, and a workflow that references it there fails validation and runs ZERO
+jobs — which is exactly how this landed the first time.
+
+**A seventh shape, and the one that does not care about load at all: the FILE
+ORDER.** The five shapes above are magnified by a busy machine, so the flake hunt
+finds them. This one is decided before any test runs, by which file bun loaded
+first — and bun does **not** load files in the order the command line lists them
+(`test:files` sorts; the CI log does not come out sorted). So the hunt is blind
+to it, the full suite passes 3573/3573 on a laptop, and CI still fails with a
+different set of tests every run.
+
+What it looked like: `test-freebuff-desktop` red on four `main` commits in a row,
+once on a commit with no file changes at all, naming ~20 tests across
+`Tab.rename`, `ContextBar.menu`, `AccountMenu.menu`, `AgentPicker.menu` and
+`QuotaBadge` — five files with nothing in common except that they are the only
+five that mount React against a real DOM. Renderers came back as the empty
+string, `fireEvent` was handed nothing to click, and the head of the cascade was
+one test sitting on `await new Promise((r) => requestAnimationFrame(r))` until
+bun's 5s budget.
+
+The cause is `global-jsdom` deciding **once per process** which globals it
+installs. Its `KEYS` list is built on the first call — every own property of the
+jsdom window that is not already on `globalThis` — and cached at module scope for
+every call after it. Two suites had left `requestAnimationFrame` on `globalThis`:
+one assigned a `() => 0` stub at module scope and put back only `fetch`, the
+other "restored" it with `Object.assign`, which writes `undefined` rather than
+removing the property. `!(k in global)` cannot tell either from a real global, so
+whichever mounted suite loaded first inherited a rAF that never fires — and so
+did the other four, for the rest of the run.
+
+Note what the loser is not: the file holding the stub passes either way. Fixing
+this by chasing the failing tests, or by re-splitting a suite to isolate it (as
+#1382 did for the quota timers), treats the victim.
+
+The cascade is worth understanding separately from the poisoning, because the two
+were fixed by different PRs. The other four files did not fail because they
+needed rAF — they failed because `Tab.rename` was killed mid-`act()` at the 5s
+budget and left React's state inconsistent for everything after it. #1569 drives
+those frames by hand instead of awaiting a real one, which removes the hang and
+therefore the cascade. That is the trigger. The mechanism below is what stays:
+verified by probe on top of #1569, a stubbed `getComputedStyle` or
+`MutationObserver` is still never replaced by jsdom's, in every mounted suite,
+for the whole run. Nothing awaits those today, so nothing is red — which is
+exactly the shape of a defect that reappears the next time someone writes a test
+that does.
+
+Two rules come out of it:
+
+1. **Restore a global by DELETING the key when there was none.** Capture
+   `Object.getOwnPropertyDescriptor` and `Reflect.deleteProperty` if it comes
+   back undefined. Assigning the captured `undefined` leaves the property in
+   place, which is all any `in` check — including global-jsdom's — looks at.
+2. **Get a DOM only from `test/support/jsdom.ts`.** `installJsdom()` clears the
+   DOM globals before handing over, so global-jsdom makes that one-shot decision
+   against bun's own globals rather than against whatever ran first, and then
+   asserts the keys React DOM needs really did come from jsdom. A stub it does
+   not know about fails there, naming the key, instead of surfacing as a timeout
+   in a file that never touched it.
+
+The general form is worth keeping in mind beyond jsdom: **a library that caches a
+decision at module scope turns "who ran first" into behaviour**, and bun's one
+process per package makes every test file a candidate for first. Contention is
+not required, so neither `flake-hunt.ts` nor a green local run says anything
+about it. Reproduce it instead by putting the suspected leak in a `--preload`,
+which is exactly "some earlier file did this", and running the affected files:
+
+```bash
+echo ';(globalThis as any).requestAnimationFrame = () => 0' > /tmp/leak.ts
+cd freebuff-desktop && bun test \
+  --preload ../test/setup-scm-loader.ts --preload ../sdk/test/setup-env.ts --preload /tmp/leak.ts \
+  src/ui/shell/Tab.rename.test.tsx src/ui/agent/QuotaBadge.test.tsx
+```

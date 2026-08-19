@@ -1,4 +1,5 @@
 import type { FreebuffAccessTier } from '../constants/freebuff-models'
+import type { FreebuffStandingInfo } from '../constants/freebuff-trust'
 
 /**
  * Wire-level shapes returned by `/api/v1/freebuff/session`. Source of truth
@@ -23,12 +24,29 @@ export interface FreebuffSessionEntitlementBreakdown {
   referral: number
   /** Sessions earned from the active streak reward for this quota period. */
   streak: number
+  /** Sessions added by a temporary promotion, for a user who already earned
+   *  their way in (a qualified referral or a bounty grant). Omitted while no
+   *  promo runs, which is the default — an older client that never reads it
+   *  still sums to the right `limit`, because the server sends the total. */
+  promo?: number
+  /**
+   * Sessions added by the account's earned LEVEL
+   * (`common/constants/freebuff-levels.ts`). Omitted at level 0, which is
+   * where every account starts, so the field is absent for most callers and an
+   * older client that never reads it still sums to the right `limit` — the
+   * server always sends the total.
+   *
+   * Distinct from `base` on purpose. `base` is what we give you; this is what
+   * you earned, and a user looking at "1 + 4" needs to be able to see which
+   * half goes away if they stop engaging.
+   */
+  level?: number
 }
 
 export interface FreebuffSessionRateLimit {
   model: string
   /** Additive detail for `limit`; omitted by older servers. New servers emit it
-   * for session quotas with `limit = base + referral + streak`. */
+   * for session quotas with `limit = base + referral + streak + promo`. */
   entitlementBreakdown?: FreebuffSessionEntitlementBreakdown
   limit: number
   /** 'pacific_day' for the daily pools (premium/limited, and the GLM 5.2
@@ -107,6 +125,32 @@ export interface FreebuffReferralInfo {
    *  Google-only users to connect one. */
   githubLinked: boolean
 }
+
+/**
+ * A live GLM 5.2 promotion, as advertised to every surface.
+ *
+ * One block drives the CLI banner, the desktop footer, the web picker, the Earn
+ * page and the landing eyebrow, so their copy cannot disagree about the size of
+ * the promo or when it ends. Present ONLY while the promo is running: absent
+ * means every surface renders exactly what it rendered before promos existed,
+ * which is what makes closing one an env change rather than a release.
+ */
+export interface FreebuffGlmPromo {
+  /** Sessions per Pacific day an earned user may run while this runs. */
+  dailySessions: number
+  /** ISO timestamp the promo closes. Surfaces count down to it rather than
+   *  hardcoding a date, so the copy can never outlive the server's window. */
+  endsAt: string
+}
+
+/** Pull the promo block off whichever session status carries it. Same loose
+ *  parameter type as `getReferralInfo`, for the same reason. */
+export const getGlmPromo = (
+  session: { status: string } | null | undefined,
+): FreebuffGlmPromo | undefined =>
+  session && 'glmPromo' in session
+    ? ((session as { glmPromo?: FreebuffGlmPromo }).glmPromo ?? undefined)
+    : undefined
 
 /** Pull the referral block off whichever session status carries it. Loose
  *  parameter type for the same reason as `getRateLimitsByModel`. */
@@ -201,12 +245,28 @@ export type FreebuffSpurStatus =
   | 'clean'
   | 'suspicious'
   | 'failed'
+  /**
+   * Deliberately not consulted: the provider is switched off, or its balance
+   * is exhausted and the breaker is open.
+   *
+   * Distinct from `failed` on purpose. `failed` means "we asked and got
+   * nothing", which is a signal about the IP's luck and is worth a risk-score
+   * floor. `skipped` means "we chose not to ask", which says nothing about the
+   * IP at all — scoring it would penalise every request in the world the
+   * moment we turn a vendor off. What it does instead is leave the escalation
+   * UNRESOLVED when no other provider answered, which the spend ceiling reads
+   * as `unverified_egress`.
+   */
+  | 'skipped'
 
 export type FreebuffScamalyticsStatus =
   | 'not_checked'
   | 'clean'
   | 'suspicious'
   | 'failed'
+  /** Deliberately not consulted — switched off, or balance exhausted and the
+   *  breaker is open. Same meaning and same reasoning as the Spur variant. */
+  | 'skipped'
 
 export type FreebuffPrivacyDecision =
   | 'allowed_clean'
@@ -214,6 +274,10 @@ export type FreebuffPrivacyDecision =
   | 'corroborated_block'
   | 'cloudflare_tor_block'
   | 'spur_failed_limited'
+  /** ipinfo flagged the egress and no second opinion was obtainable at all —
+   *  every provider disabled, exhausted, or erroring. Carries the restricted
+   *  spend ceiling so a vendor outage cannot widen anyone's budget. */
+  | 'unverified_egress_limited'
   | 'scamalytics_failed_limited'
   | 'scamalytics_suspicious_limited'
   | 'ipinfo_failed_limited'
@@ -259,6 +323,15 @@ export type FreebuffSessionServerResponse = (
        *  renders a picker. Absent whenever the pool is spent or the offer is
        *  off — see FreebuffLimitedModelOffer. */
       limitedModelOffers?: FreebuffLimitedModelOffer[]
+      /**
+       * The account's Access Level and the limits it currently selects.
+       *
+       * Sent on the pre-join response only, which is the state that renders a
+       * picker and therefore the one place a client can explain the numbers
+       * next to the models they apply to. Absent when the feature is off, so
+       * a client renders it only when there is something true to render.
+       */
+      standing?: FreebuffStandingInfo
     } & FreebuffLimitedModeReason)
   | ({
       status: 'active'
@@ -394,6 +467,25 @@ export type FreebuffSessionServerResponse = (
       message: string
       resetAt: string
       retryAfterMs: number
+      /**
+       * Present only when a PEAK-HOURS reduction is what the account ran into,
+       * so a client can say "your limit is temporarily lower, back to normal
+       * at ..." instead of the flat "you are out for the day" — which would be
+       * wrong, because the fuller allowance returns in hours, not at midnight.
+       *
+       * The windows are UTC hour pairs rather than preformatted text on
+       * purpose: only the client knows the reader's timezone, and
+       * `formatDeepSeekPeakWindowsLocal` turns these into local ranges.
+       */
+      peak?: {
+        /** Ceiling before the reduction, and the reduced one now in force. */
+        baseUsd: number
+        multiplier: number
+        /** ISO instant the current peak window closes. */
+        endsAt: string
+        /** Half-open [startHourUtc, endHourUtc) pairs. */
+        windowsUtc: Array<[number, number]>
+      }
     }
   | {
       /** Freebuff Desktop multi-session only: the user already holds an active
@@ -420,4 +512,55 @@ export type FreebuffSessionServerResponse = (
   /** Multi-session Desktop responses only. Counts live, unexpired rows across
    * all Desktop processes for this user. */
   desktopSessionCounts?: FreebuffDesktopSessionCounts
+}
+
+/**
+ * The session gate on `/api/v1/chat/completions`, as a wire contract.
+ *
+ * A rejection is identified by its `error` code paired with its HTTP status,
+ * never by its `message` — the prose is written for whoever is sitting in front
+ * of the client and is free to be rewritten. BOTH halves are required to match:
+ * 409/410 are ordinary provider outcomes on their own, and the codes are
+ * generic enough that an upstream error body can echo one, so a status-only or
+ * code-only test lets an unrelated failure impersonate the gate.
+ *
+ * `endsTheSession` marks the codes that mean the caller's row is GONE. Every
+ * one of them has the same recovery — forget the dead window and re-admit on
+ * the same instance id — which is why clients collapse them into one state
+ * rather than handling four. `false` is a refusal the session survives.
+ *
+ * Lives here because three surfaces need it and it drifted into three copies:
+ * the server that emits it (chat/completions), the CLI that matches it, and
+ * Desktop, which classifies it out of the SDK's relayed `AgentOutput`. See
+ * docs/freebuff-session-admission.md.
+ */
+export const FREEBUFF_GATE_CODES = {
+  waiting_room_required: { status: 428, endsTheSession: true },
+  session_expired: { status: 410, endsTheSession: true },
+  session_superseded: { status: 409, endsTheSession: true },
+  session_model_mismatch: { status: 409, endsTheSession: true },
+  /** The ACCOUNT is over its concurrent-tab budget; this tab's row is fine. */
+  session_limit_reached: { status: 409, endsTheSession: false },
+  /** Transient admission race — the row was caught mid-admit. */
+  waiting_room_queued: { status: 429, endsTheSession: false },
+} as const satisfies Record<string, { status: number; endsTheSession: boolean }>
+
+export type FreebuffGateCode = keyof typeof FREEBUFF_GATE_CODES
+
+/** The gate rejection this error output describes, or null for anything else.
+ *  `output` is any shape carrying the relayed `error`/`statusCode` pair.
+ *
+ *  `Object.hasOwn`, not `in`: the code is whatever an upstream error body put in
+ *  its `error` field, so `in` would accept inherited names like `toString` —
+ *  and since their `.status` is undefined, an output carrying no `statusCode`
+ *  would then satisfy the status check too and be classified as a gate
+ *  rejection. */
+export function getFreebuffGateCode(output: {
+  error?: string | undefined
+  statusCode?: number | undefined
+}): FreebuffGateCode | null {
+  const code = output.error
+  if (!code || !Object.hasOwn(FREEBUFF_GATE_CODES, code)) return null
+  const gate = FREEBUFF_GATE_CODES[code as FreebuffGateCode]
+  return gate.status === output.statusCode ? (code as FreebuffGateCode) : null
 }

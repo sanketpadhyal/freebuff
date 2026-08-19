@@ -21,7 +21,6 @@ import { loadSkills } from './skills/load-skills'
 // Re-export for SDK consumers
 export {
   KNOWLEDGE_FILE_NAMES,
-  PRIMARY_KNOWLEDGE_FILE_NAME,
   isKnowledgeFile,
 } from '@codebuff/common/constants/knowledge'
 
@@ -34,6 +33,7 @@ import type {
   AgentOutput,
   SessionState,
 } from '@codebuff/common/types/session-state'
+import type { SkillsMap } from '@codebuff/common/types/skill'
 import type { CodebuffSpawn } from '@codebuff/common/types/spawn'
 import type {
   CustomToolDefinitions,
@@ -43,7 +43,7 @@ import type * as fsType from 'fs'
 
 /**
  * Given a list of candidate file paths, selects the one with highest priority.
- * Priority order: knowledge.md > AGENTS.md > CLAUDE.md (case-insensitive).
+ * Priority order: AGENTS.md > CLAUDE.md (case-insensitive).
  * Returns undefined if no knowledge files are found.
  * @internal Exported for testing
  */
@@ -81,6 +81,32 @@ export type InitialSessionStateOptions = {
   cwd?: string
   /** Optional directory path to load skills from. When provided, skills are loaded from this directory instead of the default locations. */
   skillsDir?: string
+  /**
+   * Supplies the run's skills instead of the default local-filesystem walk.
+   *
+   * Required by any host that embeds this runner in a DIFFERENT process from
+   * the repo it is acting on, because the default loader is `fs`-based and
+   * would read THIS machine's disk. Freebuff Cloud is exactly that shape: the
+   * runner lives in the freebuff/web server process while the repo lives in a
+   * Daytona sandbox (freebuff/web/src/server/agent-runner/runTurn.ts:1346
+   * passes a sandbox `cwd` that does not exist on the web server), so it
+   * injects a loader that reads the sandbox. CLI and Desktop run alongside
+   * their repo and correctly leave this unset.
+   *
+   * This is the per-run escape hatch; `includeHomeSkills` below is the blunt
+   * structural guard that keeps the home directory out of the default path
+   * even when a host forgets to set this.
+   *
+   * Called at most once, and only when a fresh session state is built. A
+   * rejection is contained: it yields no skills rather than failing the run.
+   */
+  skillsLoader?: () => Promise<SkillsMap>
+  /**
+   * Also load the user's `~/.claude/skills` and `~/.agents/skills`. Defaults to
+   * false, so an embedder gets project-only skills unless it states that this
+   * process belongs to that user. See `LoadSkillsOptions.includeHomeSkills`.
+   */
+  includeHomeSkills?: boolean
   projectFiles?: Record<string, string>
   /** Precomputed index for exactly these `projectFiles` (see
    *  ComputedProjectIndex). Ignored when `projectFiles` is absent. */
@@ -455,7 +481,7 @@ export async function loadUserKnowledgeFiles(params: {
     }
   }
 
-  // Select highest priority file (priority: knowledge.md > AGENTS.md > CLAUDE.md)
+  // Select highest priority file (priority: AGENTS.md > CLAUDE.md)
   for (const priorityName of KNOWLEDGE_FILE_NAMES_LOWERCASE) {
     const actualFileName = candidates.get(priorityName)
     if (actualFileName) {
@@ -512,7 +538,7 @@ export function selectKnowledgeFilePaths(allFilePaths: string[]): string[] {
 
 /**
  * Auto-derives knowledge files from project files if knowledgeFiles is undefined.
- * Implements fallback priority: knowledge.md > AGENTS.md > CLAUDE.md per directory.
+ * Implements fallback priority: AGENTS.md > CLAUDE.md per directory.
  */
 function deriveKnowledgeFiles(
   projectFiles: Record<string, string>,
@@ -556,7 +582,13 @@ async function loadKnowledgeFilesFromPaths(params: {
 export async function initialSessionState(
   params: InitialSessionStateOptions,
 ): Promise<SessionState> {
-  const { cwd, maxAgentSteps, skillsDir } = params
+  const {
+    cwd,
+    maxAgentSteps,
+    skillsDir,
+    skillsLoader,
+    includeHomeSkills = false,
+  } = params
   let {
     agentDefinitions,
     customToolDefinitions,
@@ -667,12 +699,29 @@ export async function initialSessionState(
     ...providedUserKnowledgeFiles,
   }
 
-  // Load skills from project and home directories
-  const skills = await loadSkills({
-    cwd: cwd ?? process.cwd(),
-    skillsPath: skillsDir,
-    verbose: false,
-  })
+  // Load skills. An injected loader wins outright: it is the only correct
+  // source for a host whose repo is not on this machine (see `skillsLoader`).
+  // Skills are prompt content, never control flow, so a loader that throws
+  // must degrade to "no skills" rather than take the whole turn down with it.
+  let skills: SkillsMap
+  if (skillsLoader) {
+    try {
+      skills = await skillsLoader()
+    } catch (error) {
+      logger.error(
+        { error: getErrorObject(error) },
+        'Injected skills loader failed; continuing with no skills',
+      )
+      skills = {}
+    }
+  } else {
+    skills = await loadSkills({
+      cwd: cwd ?? process.cwd(),
+      skillsPath: skillsDir,
+      verbose: false,
+      includeHomeSkills,
+    })
+  }
 
   const initialState = getInitialSessionState({
     projectRoot: cwd ?? process.cwd(),
@@ -685,6 +734,11 @@ export async function initialSessionState(
     agentTemplates: processedAgentTemplates,
     customToolDefinitions: processedCustomToolDefinitions,
     skills,
+    // Carried into the context so the `skill` TOOL's own disk lookup obeys the
+    // same decision as the loader above. They are two independent lookups and
+    // the tool's result wins, so one flag has to govern both or the opt-in is
+    // only half real.
+    includeHomeSkills,
     gitChanges,
     changesSinceLastChat: {},
     shellConfigFiles: {},

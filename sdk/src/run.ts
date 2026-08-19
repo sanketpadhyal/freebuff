@@ -1,11 +1,13 @@
 import path from 'path'
 
 import { callMainPrompt } from '@codebuff/agent-runtime/main-prompt'
+import { adjustContextTokenCountForHistoryEdit } from '@codebuff/agent-runtime/util/context-token-count'
 import {
   buildUserMessageContent,
   withSystemTags,
 } from '@codebuff/agent-runtime/util/messages'
 import { MAX_AGENT_STEPS_DEFAULT } from '@codebuff/common/constants/agents'
+import { dropUnansweredToolCalls } from '@codebuff/common/util/messages'
 import {
   FILE_READ_STATUS,
   toOptionalFile,
@@ -58,32 +60,22 @@ import type { AgentDefinition } from '@codebuff/common/templates/initial-agents-
 import type { ToolName } from '@codebuff/common/tools/constants'
 import type { PublishedClientToolName } from '@codebuff/common/tools/list'
 import type { Logger } from '@codebuff/common/types/contracts/logger'
+import type {
+  AgentUsageData,
+  ContextCompactionData,
+} from '@codebuff/common/types/contracts/llm'
 import type { TraceWriter } from '@codebuff/common/types/contracts/trace'
 import type { CodebuffFileSystem } from '@codebuff/common/types/filesystem'
-import type { ToolMessage } from '@codebuff/common/types/messages/codebuff-message'
 import type {
-  ImagePart,
-  TextPart,
-  ToolResultOutput,
-} from '@codebuff/common/types/messages/content-part'
+  Message,
+  ToolMessage,
+} from '@codebuff/common/types/messages/codebuff-message'
+import type { ToolResultOutput } from '@codebuff/common/types/messages/content-part'
 import type { PrintModeEvent } from '@codebuff/common/types/print-mode'
 import type { SessionState } from '@codebuff/common/types/session-state'
+import type { SkillsMap } from '@codebuff/common/types/skill'
 import type { Source } from '@codebuff/common/types/source'
 import type { CodebuffSpawn } from '@codebuff/common/types/spawn'
-
-/**
- * Wraps content for user messages, ensuring text is wrapped in <user_message> tags.
- * Uses buildUserMessageContent from agent-runtime for consistency.
- */
-const wrapContentForUserMessage = (
-  content?: (TextPart | ImagePart)[],
-): (TextPart | ImagePart)[] | undefined => {
-  if (!content || content.length === 0) {
-    return content
-  }
-  // Delegate to the shared utility which handles wrapping correctly
-  return buildUserMessageContent(undefined, undefined, content)
-}
 
 type OverrideToolHandlers = {
   [K in PublishedClientToolName]?: (input: any) => Promise<ToolResultOutput[]>
@@ -91,6 +83,12 @@ type OverrideToolHandlers = {
   // Include read_files separately, since it has a different signature.
   read_files?: (input: {
     filePaths: string[]
+    /** Present only for `windowedFileReads` agents. An override that ignores
+     *  it returns whole files, which is a cost regression rather than a
+     *  correctness bug — but it is the whole point of the flag, so overrides
+     *  on hosted surfaces window the content themselves (they hold the file
+     *  before their own read budget truncates it). */
+    fileWindows?: Record<string, FileReadWindow[]>
   }) => Promise<Record<string, string | null>>
 }
 
@@ -111,6 +109,22 @@ export type CodebuffClientOptions = {
   cwd?: string
   /** Optional directory path to load skills from. Skills found here will be available to the `skill` tool. */
   skillsDir?: string
+  /**
+   * Supplies the run's skills instead of the default local-filesystem walk.
+   *
+   * Set this when the repo being acted on is NOT on the machine running this
+   * SDK — the default loader reads this machine's disk, which for a
+   * server-embedded runner means the server's own files. See
+   * `InitialSessionStateOptions.skillsLoader` in ./run-state.ts.
+   */
+  skillsLoader?: () => Promise<SkillsMap>
+  /**
+   * Also load the user's `~/.claude/skills` and `~/.agents/skills`. Defaults
+   * to false. Set it only in a process that BELONGS to that user — an
+   * interactive CLI on their own machine. Anything server-side must leave it
+   * unset. See `LoadSkillsOptions.includeHomeSkills`.
+   */
+  includeHomeSkills?: boolean
   projectFiles?: Record<string, string>
   /** Precomputed index for exactly these `projectFiles` (build it with
    *  `computeProjectIndexFromFiles`). Skips the per-run tree-sitter parse;
@@ -201,6 +215,12 @@ export type RunOptions = {
    * lose the in-flight turn. The final resolved RunState supersedes any
    * snapshot; no snapshots are emitted after the run settles. */
   onStateSnapshot?: (runState: RunState) => void
+  /** Provider-reported usage for each root-agent model request. */
+  onUsage?: (usage: AgentUsageData) => void
+  /** A model request ended before an exact provider usage receipt arrived. */
+  onUsageIncomplete?: () => void
+  /** Mechanical context compaction performed by the root agent runtime. */
+  onCompaction?: (data: ContextCompactionData) => void
 }
 
 /** How often onStateSnapshot fires while a run is in flight. */
@@ -253,6 +273,65 @@ export function cloneSessionState(
   return { fileContext: state.fileContext, mainAgentState }
 }
 
+/**
+ * The session state a cancelled or errored turn persists, and the state a
+ * follow-up prompt resumes from.
+ *
+ * This is the LAST thing that edits the history — after the runtime's
+ * end-of-turn recount, not before it. It drops the half-step an interrupted
+ * turn can leave behind and appends the message explaining why the turn ended,
+ * so `contextTokenCount` has to follow: a count taken before these edits
+ * describes a history that was never stored, and the host shows that number to
+ * the user before their next message.
+ *
+ * The adjustment is a difference rather than a recount because the system
+ * prompt and tool schemas — the other half of the count — are not in scope
+ * here; carrying the delta keeps them exactly.
+ */
+export function buildCancelledSessionState(params: {
+  sessionState: SessionState
+  /** The runtime replaced the shared messageHistory, i.e. it got far enough to
+   *  record the user's prompt itself. */
+  runtimeMadeProgress: boolean
+  /** The user's prompt, re-added only when the runtime never recorded it. */
+  promptMessage?: Message
+  /** Why the turn ended. Appended as a system-tagged user message. */
+  message: string
+  logger?: Logger
+}): SessionState {
+  const { sessionState, runtimeMadeProgress, promptMessage, message, logger } =
+    params
+
+  const state = cloneSessionState(sessionState, logger)
+  const previousHistory = state.mainAgentState.messageHistory
+  // A checkpoint can land after an assistant tool call is recorded but before
+  // its result arrives. Drop that half-step at the persistence boundary so a
+  // resumed run starts from structurally valid history.
+  //
+  // Copied unconditionally: dropUnansweredToolCalls returns its input when
+  // there is nothing to drop, and the appends below must not reach the array
+  // `previousHistory` names.
+  const nextHistory = [...dropUnansweredToolCalls(previousHistory)]
+
+  if (!runtimeMadeProgress && promptMessage) {
+    nextHistory.push(promptMessage)
+  }
+  nextHistory.push({
+    role: 'user' as const,
+    content: [{ type: 'text' as const, text: withSystemTags(message) }],
+  })
+
+  state.mainAgentState.messageHistory = nextHistory
+  state.mainAgentState.contextTokenCount = adjustContextTokenCountForHistoryEdit(
+    {
+      contextTokenCount: state.mainAgentState.contextTokenCount,
+      previousHistory,
+      nextHistory,
+    },
+  )
+  return state
+}
+
 const createAbortError = (signal?: AbortSignal) => {
   if (signal?.reason instanceof Error) {
     return signal.reason
@@ -294,6 +373,8 @@ async function runOnce({
 
   cwd,
   skillsDir,
+  skillsLoader,
+  includeHomeSkills,
   projectFiles,
   projectIndex,
   knowledgeFiles,
@@ -326,6 +407,9 @@ async function runOnce({
   costMode,
   extraCodebuffMetadata,
   onStateSnapshot,
+  onUsage,
+  onUsageIncomplete,
+  onCompaction,
 }: RunExecutionOptions): Promise<RunState> {
   const fsSourceValue = typeof fsSource === 'function' ? fsSource() : fsSource
   const fs = await fsSourceValue
@@ -336,7 +420,6 @@ async function runOnce({
   } else {
     spawn = require('child_process').spawn as CodebuffSpawn
   }
-  const preparedContent = wrapContentForUserMessage(content)
   let activeCustomToolDefinitions = customToolDefinitions ?? []
 
   // Init session state
@@ -368,6 +451,8 @@ async function runOnce({
     sessionState = await initialSessionState({
       cwd,
       skillsDir,
+      skillsLoader,
+      includeHomeSkills,
       knowledgeFiles,
       agentDefinitions,
       customToolDefinitions,
@@ -428,23 +513,21 @@ async function runOnce({
     const runtimeMadeProgress =
       sessionState.mainAgentState.messageHistory !== initialMessageHistory
 
-    const state = cloneSessionState(sessionState, logger)
-
-    // Only add the user's message if the runtime didn't get a chance to add it.
-    if (!runtimeMadeProgress && (prompt || preparedContent)) {
-      state.mainAgentState.messageHistory.push({
-        role: 'user' as const,
-        content: buildUserMessageContent(prompt, params, preparedContent),
-        tags: ['USER_PROMPT'] as string[],
-      })
-    }
-
-    // Add error context message
-    state.mainAgentState.messageHistory.push({
-      role: 'user' as const,
-      content: [{ type: 'text' as const, text: withSystemTags(message) }],
+    return buildCancelledSessionState({
+      sessionState,
+      runtimeMadeProgress,
+      // Only add the user's message if the runtime didn't get a chance to.
+      promptMessage:
+        prompt || content
+          ? {
+              role: 'user' as const,
+              content: buildUserMessageContent(prompt, params, content),
+              tags: ['USER_PROMPT'] as string[],
+            }
+          : undefined,
+      message,
+      logger,
     })
-    return state
   }
   function getCancelledRunState(message?: string): RunState {
     message = message ?? 'Run cancelled by user.'
@@ -691,6 +774,33 @@ async function runOnce({
     }
   }
 
+  const report = <T>(callback: ((value: T) => void) | undefined) =>
+    callback
+      ? (value: T) => {
+          try {
+            callback(value)
+          } catch (error) {
+            agentRuntimeImpl.logger.debug?.(
+              { error: error instanceof Error ? error.message : String(error) },
+              'Run metrics handler threw',
+            )
+          }
+        }
+      : undefined
+  const reportSignal = (callback: (() => void) | undefined) =>
+    callback
+      ? () => {
+          try {
+            callback()
+          } catch (error) {
+            agentRuntimeImpl.logger.debug?.(
+              { error: error instanceof Error ? error.message : String(error) },
+              'Run metrics handler threw',
+            )
+          }
+        }
+      : undefined
+
   callMainPrompt({
     ...agentRuntimeImpl,
     promptId,
@@ -699,7 +809,7 @@ async function runOnce({
       promptId,
       prompt,
       promptParams: params,
-      content: preparedContent,
+      content,
       fingerprintId: fingerprintId,
       costMode: costMode ?? 'normal',
       sessionState,
@@ -716,6 +826,9 @@ async function runOnce({
       trace_session_id: traceSessionId,
     },
     signal: signal ?? new AbortController().signal,
+    onAgentUsageReceived: report(onUsage),
+    onAgentUsageIncomplete: reportSignal(onUsageIncomplete),
+    onCompaction: report(onCompaction),
   }).catch((error) => {
     let errorMessage = isFetchIdleTimeoutError(error)
       ? FETCH_IDLE_TIMEOUT_USER_MESSAGE
@@ -786,10 +899,17 @@ async function readFiles({
   enforceEnvPolicy?: boolean
 }) {
   if (override) {
-    // TODO: fileWindows is not forwarded to overrides, so windowedFileReads
-    // agents on override surfaces (freebuff web harness, webcontainer, nodepod)
-    // would get whole files with no cap despite the windowed tool description.
-    if (!enforceEnvPolicy) return await override({ filePaths })
+    // Windows are forwarded, not applied here: an override reads from a remote
+    // workspace and applies its own output budget, so windowing after it has
+    // already truncated a large file would answer an offset past the cut-off
+    // with "beyond the end of the file". The override windows before its own
+    // limiter, in the same order the local path does.
+    if (!enforceEnvPolicy) {
+      return await override({
+        filePaths,
+        ...(fileWindows ? { fileWindows } : {}),
+      })
+    }
 
     const result = Object.create(null) as Record<string, string | null>
     const readablePaths: string[] = []
@@ -802,7 +922,10 @@ async function readFiles({
       }
     }
     if (readablePaths.length > 0) {
-      const loadedFiles = await override({ filePaths: readablePaths })
+      const loadedFiles = await override({
+        filePaths: readablePaths,
+        ...(fileWindows ? { fileWindows } : {}),
+      })
       if (
         !loadedFiles ||
         typeof loadedFiles !== 'object' ||

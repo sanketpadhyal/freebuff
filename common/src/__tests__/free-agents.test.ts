@@ -14,16 +14,18 @@ import {
   FREEBUFF_GEMINI_PRO_MODEL_ID,
   FREEBUFF_GLM_V52_MODEL_ID,
   FREEBUFF_GPT_5_6_LUNA_MODEL_ID,
-  FREEBUFF_LING_3_FLASH_MODEL_ID,
+  FREEBUFF_KIMI_K3_ECO_MODEL_ID,
   FREEBUFF_MIMO_V25_MODEL_ID,
-  FREEBUFF_POOLSIDE_LAGUNA_S_21_MODEL_ID,
-  FREEBUFF_POOLSIDE_LAGUNA_S_21_OPENROUTER_MODEL_ID,
 } from '../constants/freebuff-models'
 import { minimaxModels } from '../constants/model-config'
 import { FREEBUFF_GEMINI_THINKER_AGENT_ID } from '../constants/freebuff-gemini-thinker'
 import {
+  FREEBUFF_BASE3_AGENT_IDS,
+  FREEBUFF_CLI_BASE3_AGENT_ID_BY_MODEL,
+  FREEBUFF_DESKTOP_AUTORUN_AGENT_ID,
   FREEBUFF_DESKTOP_THREAD_AGENT_IDS,
   FREEBUFF_REVIEWER_AGENT_ID_BY_MODEL,
+  FREEBUFF_WEB_BASE3_AGENT_ID_BY_MODEL,
   FREE_MODE_AGENT_MODELS,
   FREEBUFF_ROOT_AGENT_IDS,
   FREEBUFF_ROOT_SYSTEM_PROMPT_OPENINGS,
@@ -32,8 +34,9 @@ import {
   isFreebuffGeminiThinkerAgent,
   isFreebuffRootAgent,
   isFreeModeAllowedAgentModel,
-  shouldUseLocalTokenCountForFreebuffDeepseekFlash,
+  isLimitedTierSubstitutedModel,
 } from '../constants/free-agents'
+import { LIMITED_FREEBUFF_MODEL_ID } from '../constants/freebuff-models'
 
 const FREEBUFF_KIMI_MODEL_ID = 'moonshotai/kimi-k2.7-code'
 
@@ -63,20 +66,12 @@ describe('free mode agent model allowlist', () => {
     expect(getFreebuffRootAgentIdForModel(FREEBUFF_GPT_5_6_LUNA_MODEL_ID)).toBe(
       'base2-free-luna',
     )
-    expect(
-      getFreebuffRootAgentIdForModel(FREEBUFF_POOLSIDE_LAGUNA_S_21_MODEL_ID),
-    ).toBe('base2-free-laguna-s-2-1')
-    expect(
-      getFreebuffRootAgentIdForModel(
-        FREEBUFF_POOLSIDE_LAGUNA_S_21_OPENROUTER_MODEL_ID,
-      ),
-    ).toBe('base2-free-laguna-s-2-1-openrouter')
-    expect(getFreebuffRootAgentIdForModel(FREEBUFF_LING_3_FLASH_MODEL_ID)).toBe(
-      'base2-free-ling-3-flash',
+    expect(getFreebuffRootAgentIdForModel(FREEBUFF_KIMI_K3_ECO_MODEL_ID)).toBe(
+      'base2-free-kimi-k3-eco',
     )
     // Root ids must also be registered, or the chat-completions hierarchy gate
     // 403s the subagents this root spawns.
-    expect(isFreebuffRootAgent('base2-free-ling-3-flash')).toBe(true)
+    expect(isFreebuffRootAgent('base2-free-kimi-k3-eco')).toBe(true)
     expect(isFreebuffRootAgent('base2-free-luna')).toBe(true)
   })
 
@@ -187,30 +182,12 @@ describe('free mode agent model allowlist', () => {
     ).toBe(false)
     expect(
       isFreeModeAllowedAgentModel(
-        'base2-free-laguna-s-2-1',
-        FREEBUFF_POOLSIDE_LAGUNA_S_21_MODEL_ID,
+        'base2-free-kimi-k3-eco',
+        FREEBUFF_KIMI_K3_ECO_MODEL_ID,
       ),
     ).toBe(true)
     expect(
-      isFreeModeAllowedAgentModel(
-        'base2-free-laguna-s-2-1-openrouter',
-        FREEBUFF_POOLSIDE_LAGUNA_S_21_OPENROUTER_MODEL_ID,
-      ),
-    ).toBe(true)
-    expect(
-      isFreeModeAllowedAgentModel(
-        'base2-free-laguna-s-2-1',
-        FREEBUFF_POOLSIDE_LAGUNA_S_21_OPENROUTER_MODEL_ID,
-      ),
-    ).toBe(false)
-    expect(
-      isFreeModeAllowedAgentModel(
-        'base2-free-ling-3-flash',
-        FREEBUFF_LING_3_FLASH_MODEL_ID,
-      ),
-    ).toBe(true)
-    expect(
-      isFreeModeAllowedAgentModel('base2-free', FREEBUFF_LING_3_FLASH_MODEL_ID),
+      isFreeModeAllowedAgentModel('base2-free', FREEBUFF_KIMI_K3_ECO_MODEL_ID),
     ).toBe(false)
     expect(
       isFreeModeAllowedAgentModel(
@@ -332,7 +309,13 @@ describe('free mode agent model allowlist', () => {
       FREEBUFF_GLM_V52_MODEL_ID,
     ]
 
-    for (const agentId of FREEBUFF_DESKTOP_THREAD_AGENT_IDS) {
+    // The auto-run decider rides the same allowlist as the thread roots: it
+    // decides on the tab's own model, which is the one that tab's session was
+    // admitted with, so anything narrower 403s with session_model_mismatch.
+    for (const agentId of [
+      ...FREEBUFF_DESKTOP_THREAD_AGENT_IDS,
+      FREEBUFF_DESKTOP_AUTORUN_AGENT_ID,
+    ]) {
       for (const model of desktopModels) {
         expect(isFreeModeAllowedAgentModel(agentId, model)).toBe(true)
       }
@@ -354,6 +337,94 @@ describe('free mode agent model allowlist', () => {
           MINIMAX_M3_MODEL_ID,
         ),
       ).toBe(false)
+    }
+  })
+
+  test('allows each Web/Cloud base3 root only with the model it pins', () => {
+    const entries = Object.entries(FREEBUFF_WEB_BASE3_AGENT_ID_BY_MODEL)
+    // Floor: a map that silently emptied would pass every loop below.
+    expect(entries.length).toBeGreaterThanOrEqual(8)
+
+    for (const [model, agentId] of entries) {
+      expect(isFreeModeAllowedAgentModel(agentId, model)).toBe(true)
+      // A root is only reachable at all if the hierarchy gate knows it.
+      expect(isFreebuffRootAgent(agentId)).toBe(true)
+      // One model each, like every other pinned root: the pool and queue
+      // accounting keys off the model, so a root that could run a second one
+      // would let a turn escape it.
+      expect(FREE_MODE_AGENT_MODELS[agentId]?.size).toBe(1)
+      // Not a licence for anything else, free or paid.
+      expect(
+        isFreeModeAllowedAgentModel(agentId, 'anthropic/claude-sonnet-4.5'),
+      ).toBe(false)
+      expect(isFreeModeAllowedAgentModel(agentId, FREEBUFF_KIMI_MODEL_ID)).toBe(
+        false,
+      )
+      // Publisher-spoof safe.
+      expect(isFreeModeAllowedAgentModel(`other/${agentId}@0.0.1`, model)).toBe(
+        false,
+      )
+      expect(isFreebuffRootAgent(`other/${agentId}`)).toBe(false)
+    }
+  })
+
+  test('every base3 root id in the maps is listed in FREEBUFF_ROOT_AGENT_IDS', () => {
+    // The list is written out by hand so the ids stay greppable; this is what
+    // stops the two from drifting. An id missing from the list 403s its own
+    // requests, since the marker gate only applies to recognized roots.
+    //
+    // Both surfaces' maps, because the CLI covers a model Web does not (Fable)
+    // and Web covers three the CLI cannot select. Checking only one map would
+    // read the other's ids as stale.
+    const roots = new Set<string>(FREEBUFF_ROOT_AGENT_IDS)
+    const missing = [...FREEBUFF_BASE3_AGENT_IDS].filter(
+      (id) => !roots.has(id),
+    )
+    expect(missing).toEqual([])
+
+    const stale = FREEBUFF_ROOT_AGENT_IDS.filter(
+      (id) => id.startsWith('base3-') && !FREEBUFF_BASE3_AGENT_IDS.has(id),
+    )
+    expect(stale).toEqual([])
+  })
+
+  test('allows each Freebuff CLI base3 root only with the model it pins', () => {
+    const entries = Object.entries(FREEBUFF_CLI_BASE3_AGENT_ID_BY_MODEL)
+    // Floor: a map that silently emptied would pass every loop below.
+    expect(entries.length).toBeGreaterThanOrEqual(7)
+
+    for (const [model, agentId] of entries) {
+      expect(isFreeModeAllowedAgentModel(agentId, model)).toBe(true)
+      expect(isFreebuffRootAgent(agentId)).toBe(true)
+      expect(FREE_MODE_AGENT_MODELS[agentId]?.size).toBe(1)
+      expect(
+        isFreeModeAllowedAgentModel(agentId, 'anthropic/claude-sonnet-4.5'),
+      ).toBe(false)
+      // Publisher-spoof safe.
+      expect(isFreeModeAllowedAgentModel(`other/${agentId}@0.0.1`, model)).toBe(
+        false,
+      )
+    }
+  })
+
+  test('CLI and Web agree on the ids they share', () => {
+    // The two surfaces ship separate definitions under one id on purpose. They
+    // must still name the SAME id for the same model, or a CLI turn and a Web
+    // turn on one model land in different rows and the base2-vs-base3
+    // comparison silently splits.
+    for (const [model, cliId] of Object.entries(
+      FREEBUFF_CLI_BASE3_AGENT_ID_BY_MODEL,
+    )) {
+      const webId = FREEBUFF_WEB_BASE3_AGENT_ID_BY_MODEL[model]
+      if (webId) expect(cliId).toBe(webId)
+    }
+  })
+
+  test('every model the CLI picker offers has a base3 root', () => {
+    // A model missing here silently falls back to its base2 root — no error,
+    // just the old cost profile for whoever picked it.
+    for (const model of SUPPORTED_FREEBUFF_MODELS) {
+      expect(FREEBUFF_CLI_BASE3_AGENT_ID_BY_MODEL[model.id]).toBeDefined()
     }
   })
 
@@ -453,36 +524,58 @@ describe('free mode agent model allowlist', () => {
     ).toBe(false)
   })
 
-  test('uses local token count only for the DeepSeek Flash freebuff root', () => {
+})
+
+describe('isLimitedTierSubstitutedModel', () => {
+  // The free-session gate substitutes the limited tier's model for a pick that
+  // tier no longer offers, so the request lands on a root pinned to the model
+  // the user picked. Billing has to admit it too, or the turn silently meters.
+  const FLASH_PINNED_ROOTS = [
+    'base3-free-deepseek-flash',
+    'base2-free-deepseek-flash',
+  ]
+
+  test('admits the limited model on roots pinned to something else', () => {
+    for (const agentId of FLASH_PINNED_ROOTS) {
+      // The premise: without this, billing would call the substituted turn metered.
+      expect(isFreeModeAllowedAgentModel(agentId, LIMITED_FREEBUFF_MODEL_ID)).toBe(
+        false,
+      )
+      expect(isLimitedTierSubstitutedModel(agentId, LIMITED_FREEBUFF_MODEL_ID)).toBe(
+        true,
+      )
+      // The published, versioned form is how ids actually arrive.
+      expect(
+        isLimitedTierSubstitutedModel(
+          `codebuff/${agentId}@0.0.1`,
+          LIMITED_FREEBUFF_MODEL_ID,
+        ),
+      ).toBe(true)
+    }
+  })
+
+  test('is only ever the limited tier’s own model', () => {
+    for (const model of [
+      FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID,
+      FREEBUFF_DEEPSEEK_V4_PRO_MODEL_ID,
+      FREEBUFF_GPT_5_6_LUNA_MODEL_ID,
+      FREEBUFF_GLM_V52_MODEL_ID,
+    ]) {
+      expect(isLimitedTierSubstitutedModel('base2-free', model)).toBe(false)
+    }
+  })
+
+  // The substitution widens free mode, so it must not widen who can claim it:
+  // the agent still has to be one free mode already knows, published by us.
+  test('refuses unknown agents and foreign publishers', () => {
     expect(
-      shouldUseLocalTokenCountForFreebuffDeepseekFlash({
-        agentId: 'base2-free-deepseek-flash',
-        model: FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID,
-      }),
-    ).toBe(true)
-    expect(
-      shouldUseLocalTokenCountForFreebuffDeepseekFlash({
-        agentId: 'codebuff/base2-free-deepseek-flash@0.0.1',
-        model: FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID,
-      }),
-    ).toBe(true)
-    expect(
-      shouldUseLocalTokenCountForFreebuffDeepseekFlash({
-        agentId: 'base2-free-deepseek',
-        model: FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID,
-      }),
+      isLimitedTierSubstitutedModel('not-an-agent', LIMITED_FREEBUFF_MODEL_ID),
     ).toBe(false)
     expect(
-      shouldUseLocalTokenCountForFreebuffDeepseekFlash({
-        agentId: 'base2-free-deepseek-flash',
-        model: FREEBUFF_DEEPSEEK_V4_PRO_MODEL_ID,
-      }),
-    ).toBe(false)
-    expect(
-      shouldUseLocalTokenCountForFreebuffDeepseekFlash({
-        agentId: 'other/base2-free-deepseek-flash@0.0.1',
-        model: FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID,
-      }),
+      isLimitedTierSubstitutedModel(
+        'attacker/base2-free@1.0.0',
+        LIMITED_FREEBUFF_MODEL_ID,
+      ),
     ).toBe(false)
   })
 })
@@ -578,6 +671,8 @@ describe('every freebuff root agent declares a prompt opening', () => {
   const BASE2 = 'You are Buffy, the strategic coding assistant.'
   const BASE3 = 'You are Buffy, the coding agent behind Codebuff.'
   const CLOUD_PLANNER = 'You are Buffy, the Freebuff Cloud project planner.'
+  const DESKTOP_AUTORUN =
+    'You are Buffy, the auto-run agent behind Freebuff Desktop.'
 
   /** Root agent id → the opening its system prompt starts with. */
   const PROMPT_FAMILY: Record<string, string> = {
@@ -588,14 +683,15 @@ describe('every freebuff root agent declares a prompt opening', () => {
     'base2-free-minimax-m3': BASE2,
     'base2-free-luna': BASE2,
     'base2-free-glm': BASE2,
-    'base2-free-laguna-s-2-1': BASE2,
-    'base2-free-laguna-s-2-1-openrouter': BASE2,
-    'base2-free-ling-3-flash': BASE2,
-    // God-only Greg 2 roots; createBase2('free', …) like their siblings.
-    'base2-free-greg-2-ultra': BASE2,
-    'base2-free-greg-2-super': BASE2,
+    // God-only Kimi K3 test root; createBase2('free', …) like its siblings.
+    'base2-free-kimi-k3-eco': BASE2,
     // Limited-offer trial root; createBase2('free', …) like its siblings.
     'base2-free-fable': BASE2,
+    // Extended-context `-max` roots; createBase2('free', …) like their
+    // siblings.
+    'base2-free-deepseek-pro-max': BASE2,
+    'base2-free-deepseek-flash-max': BASE2,
+    'base2-free-luna-max': BASE2,
     // Web-only Muse Spark root; createBase2('free', …) like its siblings.
     'base2-free-muse-spark': BASE2,
     'base2-free-cloud-planner': CLOUD_PLANNER,
@@ -604,6 +700,14 @@ describe('every freebuff root agent declares a prompt opening', () => {
     ...Object.fromEntries(
       FREEBUFF_DESKTOP_THREAD_AGENT_IDS.map((id) => [id, BASE3]),
     ),
+    // Web/Cloud base3 roots do the same: createWebBase3Root appends the Web
+    // appendix after base3's prompt, never before it. So do the CLI roots —
+    // createBase3CliRoot appends its own appendix the same way.
+    ...Object.fromEntries([...FREEBUFF_BASE3_AGENT_IDS].map((id) => [id, BASE3])),
+    // The Desktop auto-run decider writes its own prompt rather than composing
+    // onto base3's: base3 tells the model it is the coding agent, and this one
+    // exists to say it is not.
+    [FREEBUFF_DESKTOP_AUTORUN_AGENT_ID]: DESKTOP_AUTORUN,
   }
 
   test('no root agent is missing from the prompt-family map', () => {
@@ -679,8 +783,25 @@ describe('canonical root prompt openings match their source definitions', () => 
       'thread-agent.ts',
     )
     // Position 0 of the desktop prompt must stay the base3 prompt, or the
-    // desktop roots stop matching any canonical opening.
-    expect(source).toContain('systemPrompt: `${base3.systemPrompt}')
+    // desktop roots stop matching any canonical opening. Since #1444 the
+    // prompt is composed as an array join with base3.systemPrompt first.
+    expect(source).toMatch(/const systemPrompt = \[\s*base3\.systemPrompt,/)
+  })
+
+  test('desktop mission decider opens with its own canonical line', () => {
+    const source = read(
+      'freebuff-desktop',
+      'src',
+      'server',
+      'services',
+      'mission.ts',
+    )
+    const opening = 'You are Buffy, the auto-run agent behind Freebuff Desktop.'
+    // The decision is a free-mode ROOT request, so this sentence has to sit at
+    // position 0 of the first system message or the gate 403s every tab on Auto
+    // — which is a silent failure, since a tab that cannot decide just stops.
+    expect(source).toContain(`return \`${opening}`)
+    expect(FREEBUFF_ROOT_SYSTEM_PROMPT_OPENINGS).toContain(opening)
   })
 
   test('base3 createBase3 prompt (desktop thread roots)', () => {

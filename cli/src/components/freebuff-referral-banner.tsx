@@ -1,3 +1,7 @@
+import {
+  FREEBUFF_EARN_PATH,
+  FREEBUFF_EARN_PROMPT_SHORT,
+} from '@codebuff/common/constants/freebuff-levels'
 import { TextAttributes } from '@opentui/core'
 import React, { useCallback, useEffect, useRef, useState } from 'react'
 
@@ -16,7 +20,10 @@ import { safeOpen } from '../utils/open-url'
 import { BORDER_CHARS } from '../utils/ui-constants'
 
 import type { FreebuffAccessTier } from '@codebuff/common/constants/freebuff-models'
-import type { FreebuffReferralInfo } from '@codebuff/common/types/freebuff-session'
+import type {
+  FreebuffGlmPromo,
+  FreebuffReferralInfo,
+} from '@codebuff/common/types/freebuff-session'
 
 /** Build a friend's share link from the referral code. Points at the
  *  /get-started page (CLI install walkthrough + hero + FAQs) rather than the
@@ -30,31 +37,88 @@ function referralLink(code: string, referrerName: string | null): string {
   return `${LOGIN_WEBSITE_URL}/get-started?${params.toString()}`
 }
 
-/** Where a user goes to earn a GLM session without referring anyone. */
-const EARN_URL = `${LOGIN_WEBSITE_URL}/earn`
-
 /**
- * The other way to get GLM 5.2, advertised wherever referrals are.
+ * The Earn page, on the tab that pays TODAY.
  *
- * Referrals only pay when somebody else shows up, which is nothing for a user
- * with no audience — bounties pay for work they control, and grant a session
- * that is redeemable from any region. The CLI cannot open a browser for them,
- * so the URL is spelled out rather than hidden behind a button.
+ * Was `/earn?tab=referrals#referral-status`, which sent a rate-limited user to
+ * the slowest of the three ways to earn — a referral pays when somebody else
+ * signs up and sticks around. `/earn/trust` is the engagement feed, which pays
+ * within a minute. `FREEBUFF_EARN_PATH` is shared so the CLI, Desktop and the
+ * browser all point at the same place.
  */
-function BountyPitchLine({ theme }: { theme: ReturnType<typeof useTheme> }) {
+const EARN_URL = `${LOGIN_WEBSITE_URL}${FREEBUFF_EARN_PATH}`
+const DASHBOARD_LABEL = `${FREEBUFF_EARN_PROMPT_SHORT} ↵`
+// Two columns of leading space separate the label from the copy control beside
+// it (the row itself has no gap), and they stay put in every state so keyboard
+// navigation never shifts the rest of the action row.
+const DASHBOARD_GUTTER = '  '
+const DASHBOARD_BUTTON_WIDTH = DASHBOARD_LABEL.length + DASHBOARD_GUTTER.length
+
+/** The temporary promo still needs its deadline even though the standing
+ * bounty pitch is already covered elsewhere in the picker and Earn page. */
+function BountyPromoLine({
+  theme,
+  promo,
+}: {
+  theme: ReturnType<typeof useTheme>
+  promo?: FreebuffGlmPromo
+}) {
+  if (!promo) return null
   return (
     <text style={{ wrapMode: 'word' }}>
-      <span fg={theme.muted}>✦ Or earn </span>
-      <span fg={theme.foreground}>GLM 5.2</span>
-      <span fg={theme.muted}> for small tasks: {EARN_URL}</span>
+      <span fg={theme.success ?? theme.foreground}>
+        ✦ Promo: earn a bounty, spend up to {promo.dailySessions} a day
+      </span>
+      <span fg={theme.muted}> (ends {formatPromoEnd(promo.endsAt)})</span>
     </text>
   )
+}
+
+function DashboardButton({
+  theme,
+  focused,
+  onOpen,
+}: {
+  theme: ReturnType<typeof useTheme>
+  focused: boolean
+  onOpen: () => void
+}) {
+  // Focus is shown by the accent color alone, like the inline copy control it
+  // sits next to. A leading marker would have to eat the gutter that keeps the
+  // two labels apart, so a focused dashboard link ran flush into "Copy invite
+  // link" and read as overlapping it.
+  return (
+    <Button onClick={onOpen}>
+      <text style={{ wrapMode: 'word' }}>
+        <span
+          fg={focused ? theme.primary : theme.secondary}
+          attributes={focused ? TextAttributes.BOLD : TextAttributes.NONE}
+        >
+          {DASHBOARD_GUTTER}
+          {DASHBOARD_LABEL}
+        </span>
+      </text>
+    </Button>
+  )
+}
+
+/** Short, local date for the promo's end. The server sends the instant; every
+ * surface formats it, so none of them can drift from the real window. */
+function formatPromoEnd(endsAt: string): string {
+  const at = new Date(endsAt)
+  return Number.isNaN(at.getTime())
+    ? 'soon'
+    : at.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
 }
 
 // Navigation ids for the banner's keyboard-focusable buttons. The model
 // selector owns the landing keyboard handler and appends these after its rows.
 const COPY_FOCUS_ID = '__freebuff_referral_copy__'
 const GLM_FOCUS_ID = '__freebuff_referral_glm__'
+/** Opens the Earn page — bounties to claim, referrals to track, balance to
+ *  read. The CLI can open a browser (`safeOpen`), so this is a real button
+ *  rather than a URL the user has to select and paste. */
+const DASHBOARD_FOCUS_ID = '__freebuff_referral_dashboard__'
 const BUTTON_HORIZONTAL_CHROME = 6 // two border + four padding columns
 
 export interface FreebuffReferralFocusTarget {
@@ -62,10 +126,10 @@ export interface FreebuffReferralFocusTarget {
   activate: () => void
 }
 
-/** Below this menu width, the two unlocked-card actions no longer fit beside
- * each other. */
+/** Below this menu width, the model action and referral/dashboard action group
+ * no longer fit beside each other. */
 const shouldStackFreebuffReferralActions = (width: number): boolean =>
-  width < 62
+  width < 70
 
 const firstLabelThatFits = (
   availableWidth: number,
@@ -130,7 +194,7 @@ const CopyInviteLinkButton: React.FC<{
         onClick={onCopy}
         onMouseOver={() => setIsHovered(true)}
         onMouseOut={() => setIsHovered(false)}
-        style={{ marginTop: 1, flexShrink: 0 }}
+        style={{ flexShrink: 0 }}
       >
         <text style={{ wrapMode: 'none' }}>
           <span
@@ -220,6 +284,8 @@ const CopyInviteLinkButton: React.FC<{
 interface FreebuffReferralBannerProps {
   width: number
   referral: FreebuffReferralInfo
+  /** A live GLM promo, or undefined. Undefined is the ordinary state. */
+  glmPromo?: FreebuffGlmPromo
   accessTier: FreebuffAccessTier
   focusedId: string
   onFocusTargetsChange: (targets: FreebuffReferralFocusTarget[]) => void
@@ -228,6 +294,7 @@ interface FreebuffReferralBannerProps {
 export const FreebuffReferralBanner: React.FC<FreebuffReferralBannerProps> = ({
   width,
   referral,
+  glmPromo,
   accessTier,
   focusedId,
   onFocusTargetsChange,
@@ -239,6 +306,7 @@ export const FreebuffReferralBanner: React.FC<FreebuffReferralBannerProps> = ({
   const [glmHovered, setGlmHovered] = useState(false)
   const copyFocused = focusedId === COPY_FOCUS_ID
   const glmFocused = focusedId === GLM_FOCUS_ID
+  const dashboardFocused = focusedId === DASHBOARD_FOCUS_ID
 
   const useGlm = useCallback(() => {
     if (joiningRef.current) return
@@ -255,24 +323,55 @@ export const FreebuffReferralBanner: React.FC<FreebuffReferralBannerProps> = ({
 
   // Register this banner's buttons as keyboard focus targets so the model
   // selector's arrow navigation flows from "see all models" into them (and
-  // wraps back up). The limited variant and the full-tier locked state show
-  // just the copy button; the full-tier unlocked card leads with "Use GLM 5.2"
-  // then the invite button.
+  // wraps back up). Locked states show copy then dashboard; the unlocked card
+  // leads with "Use GLM 5.2", then copy and dashboard.
   // A limited-tier user can now hold GLM sessions too — bounty grants are
   // redeemable in every region — so the unlocked card is keyed on the balance
   // alone rather than on the tier.
   const isLocked = (referral.weeklySessionsRemaining ?? 0) <= 0
+  const openDashboard = useCallback(() => {
+    void safeOpen(EARN_URL)
+  }, [])
+  const lockedReferralActions = (
+    <box
+      style={{
+        flexDirection: 'row',
+        alignItems: 'center',
+        gap: 0,
+        marginTop: 1,
+        flexShrink: 0,
+      }}
+    >
+      <CopyInviteLinkButton
+        isCopied={isCopied}
+        focused={copyFocused}
+        onCopy={copy}
+        availableWidth={Math.max(0, width - DASHBOARD_BUTTON_WIDTH)}
+        variant="inline"
+      />
+      <DashboardButton
+        theme={theme}
+        focused={dashboardFocused}
+        onOpen={openDashboard}
+      />
+    </box>
+  )
+
   useEffect(() => {
     onFocusTargetsChange(
       isLocked
-        ? [{ id: COPY_FOCUS_ID, activate: copy }]
+        ? [
+            { id: COPY_FOCUS_ID, activate: copy },
+            { id: DASHBOARD_FOCUS_ID, activate: openDashboard },
+          ]
         : [
             { id: GLM_FOCUS_ID, activate: useGlm },
             { id: COPY_FOCUS_ID, activate: copy },
+            { id: DASHBOARD_FOCUS_ID, activate: openDashboard },
           ],
     )
     return () => onFocusTargetsChange([])
-  }, [isLocked, copy, useGlm, onFocusTargetsChange])
+  }, [isLocked, copy, useGlm, openDashboard, onFocusTargetsChange])
 
   const { qualifiedCount, githubLinked } = referral
 
@@ -317,14 +416,8 @@ export const FreebuffReferralBanner: React.FC<FreebuffReferralBannerProps> = ({
             </span>
           )}
         </text>
-        <CopyInviteLinkButton
-          isCopied={isCopied}
-          focused={copyFocused}
-          onCopy={copy}
-          availableWidth={width}
-          variant="inline"
-        />
-        <BountyPitchLine theme={theme} />
+        {lockedReferralActions}
+        <BountyPromoLine theme={theme} promo={glmPromo} />
       </box>
     )
   }
@@ -374,14 +467,8 @@ export const FreebuffReferralBanner: React.FC<FreebuffReferralBannerProps> = ({
             </>
           )}
         </text>
-        <CopyInviteLinkButton
-          isCopied={isCopied}
-          focused={copyFocused}
-          onCopy={copy}
-          availableWidth={width}
-          variant="inline"
-        />
-        <BountyPitchLine theme={theme} />
+        {lockedReferralActions}
+        <BountyPromoLine theme={theme} promo={glmPromo} />
       </box>
     )
   }
@@ -397,6 +484,12 @@ export const FreebuffReferralBanner: React.FC<FreebuffReferralBannerProps> = ({
     '▶ GLM 5.2',
     '▶ GLM',
   ])
+  const inviteAvailableWidth = stackActions
+    ? actionRowWidth - DASHBOARD_BUTTON_WIDTH
+    : actionRowWidth -
+      (glmLabel.length + BUTTON_HORIZONTAL_CHROME) -
+      2 -
+      DASHBOARD_BUTTON_WIDTH
   // No "max earned" state: the reward is uncapped, so inviting always adds
   // another daily session.
   const inviteLabels = [
@@ -484,18 +577,30 @@ export const FreebuffReferralBanner: React.FC<FreebuffReferralBannerProps> = ({
             </span>
           </text>
         </Button>
-        <CopyInviteLinkButton
-          isCopied={isCopied}
-          focused={copyFocused}
-          onCopy={copy}
-          availableWidth={actionRowWidth}
-          labels={inviteLabels}
-        />
+        <box
+          style={{
+            flexDirection: 'row',
+            alignItems: 'center',
+            gap: 0,
+            flexShrink: 0,
+          }}
+        >
+          <CopyInviteLinkButton
+            isCopied={isCopied}
+            focused={copyFocused}
+            onCopy={copy}
+            availableWidth={inviteAvailableWidth}
+            labels={inviteLabels}
+          />
+          <DashboardButton
+            theme={theme}
+            focused={dashboardFocused}
+            onOpen={openDashboard}
+          />
+        </box>
       </box>
 
-      {/* Even holding sessions, the way to get MORE without an audience is a
-          bounty — so the pitch rides the unlocked card too. */}
-      <BountyPitchLine theme={theme} />
+      <BountyPromoLine theme={theme} promo={glmPromo} />
 
       {!githubLinked && (
         <Button

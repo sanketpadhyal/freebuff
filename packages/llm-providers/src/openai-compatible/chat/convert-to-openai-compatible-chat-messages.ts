@@ -14,6 +14,41 @@ function getOpenAIMetadata(message: {
   return message?.providerOptions?.openaiCompatible ?? {}
 }
 
+function imageUrlFromData(data: unknown, mediaType: string): string {
+  // AI SDK 7 adapts this v2 provider to v4, whose file data is tagged. The
+  // compatibility proxy passes that v4 shape through to the v2 implementation.
+  if (data && typeof data === 'object' && 'type' in data) {
+    if (data.type === 'data' && 'data' in data) {
+      data = data.data
+    } else if (data.type === 'url' && 'url' in data) {
+      // The tagged `url` may be a plain string, not only a URL instance.
+      data = data.url
+    }
+  }
+
+  if (data instanceof URL) return data.toString()
+  if (typeof data !== 'string' && !(data instanceof Uint8Array)) {
+    throw new UnsupportedFunctionalityError({
+      functionality: 'image file data that is not inline bytes or a URL',
+    })
+  }
+
+  // Never re-prefix something that is already addressable. `convertToBase64`
+  // passes a string through unchanged (it assumes the string IS base64), so
+  // prefixing a value that already carries its own `data:` scheme yields
+  // `data:image/png;base64,data:image/png;base64,…` — which the provider
+  // rejects with the same "invalid base64-encoded value" 400 that the tagged
+  // -shape handling above exists to prevent, just reached by another route.
+  if (typeof data === 'string') {
+    const trimmed = data.trim()
+    if (trimmed.startsWith('data:') || /^https?:\/\//i.test(trimmed)) {
+      return trimmed
+    }
+  }
+
+  return `data:${mediaType};base64,${convertToBase64(data)}`
+}
+
 export function convertToOpenAICompatibleChatMessages(
   prompt: LanguageModelV2Prompt,
   options?: { providerOptionsName?: string; modelId?: string },
@@ -37,17 +72,19 @@ export function convertToOpenAICompatibleChatMessages(
                 return { type: 'text', text: part.text, ...partMetadata }
               }
               case 'file': {
-                if (part.mediaType.startsWith('image/')) {
+                if (
+                  part.mediaType === 'image' ||
+                  part.mediaType.startsWith('image/')
+                ) {
                   const mediaType =
-                    part.mediaType === 'image/*' ? 'image/jpeg' : part.mediaType
+                    part.mediaType === 'image' || part.mediaType === 'image/*'
+                      ? 'image/jpeg'
+                      : part.mediaType
 
                   return {
                     type: 'image_url',
                     image_url: {
-                      url:
-                        part.data instanceof URL
-                          ? part.data.toString()
-                          : `data:${mediaType};base64,${convertToBase64(part.data)}`,
+                      url: imageUrlFromData(part.data, mediaType),
                     },
                     ...partMetadata,
                   }

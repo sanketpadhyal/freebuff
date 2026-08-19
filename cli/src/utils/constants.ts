@@ -126,16 +126,45 @@ export const isMultiPromptEditor = (agentType: string): boolean => {
 export const MAIN_AGENT_ID = 'main-agent'
 
 /**
+ * Which harness the CLI's DEFAULT and LITE modes run.
+ *
+ * base3 runs Codebuff DEFAULT and LITE plus every Freebuff picker model. MAX
+ * and PLAN remain on their purpose-built base2 roots below.
+ *
+ * Unlike Web and Cloud, the CLI has no server-side base3 kill switch: changing
+ * this routing after release requires another CLI release. The earlier Flash
+ * benchmark and rollback rationale remain documented in
+ * docs/freebuff-base3-harness.md so future harness changes preserve that
+ * context.
+ */
+export const CLI_HARNESS: 'base2' | 'base3' = 'base3'
+
+/** The only two modes that follow CLI_HARNESS. MAX and PLAN never moved, so
+ *  they are not in here — listing them per harness would invite editing one row
+ *  and not the other. */
+const HARNESS_MODE_IDS = {
+  base2: { DEFAULT: 'base2', LITE: 'base2-lite' },
+  base3: { DEFAULT: 'base3', LITE: 'base3-lite' },
+} as const
+
+/**
  * Mapping from agent mode to agent ID.
  * Single source of truth for all agent modes (order = cycling order).
  *
  * Freebuff resolves LITE through the selected freebuff model at send time;
  * this fallback stays on base2-free for non-runtime callers. Regular
- * Codebuff maps LITE to base2-lite which charges credits normally.
+ * Codebuff maps LITE to a paid lite root which charges credits normally.
+ *
+ * MAX and PLAN never moved to base3 and are unaffected by CLI_HARNESS. MAX is
+ * the mode users pick when they want the multi-prompt editor and the reviewer
+ * fan-out — the ceremony IS the product there. PLAN never touches a file, so
+ * windowed reads and single-loop-instead-of-subagents buy it nothing, and its
+ * `<PLAN>` flow (see sdk-event-handlers.ts) is tuned against base2's plan-only
+ * prompt. Same reasoning that kept the Freebuff Cloud planner on base2.
  */
 export const AGENT_MODE_TO_ID = {
-  DEFAULT: 'base2',
-  LITE: IS_FREEBUFF ? 'base2-free' : 'base2-lite',
+  DEFAULT: HARNESS_MODE_IDS[CLI_HARNESS].DEFAULT,
+  LITE: IS_FREEBUFF ? 'base2-free' : HARNESS_MODE_IDS[CLI_HARNESS].LITE,
   MAX: 'base2-max',
   PLAN: 'base2-plan',
 } as const

@@ -8,13 +8,13 @@ English | [简体中文](./README.zh-CN.md)
 
 ## Choose your Freebuff
 
-| Product                     | What it does                        | Get started                                                           |
-| --------------------------- | ----------------------------------- | --------------------------------------------------------------------- |
-| **Freebuff Desktop** (Beta) | Run parallel agents locally         | [Download for macOS, Windows, or Linux](https://freebuff.com/desktop) |
-| **Freebuff CLI**            | Code from your terminal             | [Install the CLI](https://freebuff.com/cli)                           |
-| **Freebuff Web**            | Build and ship full-stack apps      | [Build an app](https://freebuff.com/web)                              |
-| **Freebuff Cloud**          | Run agents on any GitHub repository | [Connect a repository](https://freebuff.com/cloud)                    |
-| **Freebuff Chat**           | Research and think with AI          | [Start a chat](https://freebuff.com/chat)                             |
+| Product              | What it does                        | Get started                                                           |
+| -------------------- | ----------------------------------- | --------------------------------------------------------------------- |
+| **Freebuff Desktop** | Run parallel agents locally         | [Download for macOS, Windows, or Linux](https://freebuff.com/desktop) |
+| **Freebuff CLI**     | Code from your terminal             | [Install the CLI](https://freebuff.com/cli)                           |
+| **Freebuff Web**     | Build and ship full-stack apps      | [Build an app](https://freebuff.com/web)                              |
+| **Freebuff Cloud**   | Run agents on any GitHub repository | [Connect a repository](https://freebuff.com/cloud)                    |
+| **Freebuff Chat**    | Research and think with AI          | [Start a chat](https://freebuff.com/chat)                             |
 
 ## Quick start
 
@@ -32,13 +32,15 @@ Then describe what you want. Freebuff finds the relevant files, makes changes, a
 
 Freebuff includes a curated model catalog. The regular picker currently offers:
 
-| Model                       | Access                  | Best for                                                                |
-| --------------------------- | ----------------------- | ----------------------------------------------------------------------- |
-| **DeepSeek V4 Flash 07/31** | Full and limited access | The default for CLI and Desktop; fast coding and tool use               |
-| **DeepSeek V4 Pro**         | Full access             | Longer, deeper reasoning                                                |
-| **GPT-5.6 Luna**            | Full access             | The default for Web, Cloud, and Chat; deep reasoning with image support |
-| **MiniMax M3**              | Full access             | Fast responses with image support                                       |
-| **MiMo 2.5**                | Full and limited access | Balanced performance with image support                                 |
+| Model                       | Access                  | Best for                                                           |
+| --------------------------- | ----------------------- | ------------------------------------------------------------------ |
+| **GPT-5.6 Luna**            | Full access             | The default everywhere in full mode; deep reasoning, native images |
+| **DeepSeek V4 Flash 07/31** | Full access             | Fast coding and tool use; capped at one session a day              |
+| **MiniMax M3**              | Full access             | Fast responses with image support                                  |
+| **MiMo 2.5**                | Full and limited access | The limited-mode default; balanced performance with image support  |
+| **DeepSeek V4 Pro**         | Full access             | Deepest reasoning; shares DeepSeek's one session a day             |
+
+While upstream prices are high, two things are **temporary**: V4 Flash uses a premium session rather than being unlimited, and the DeepSeek models may serve from a quantized (Q8_0) build to keep costs down. MiMo 2.5 is unlimited in the meantime. Both are intended to be reverted.
 
 Beyond the regular picker:
 
@@ -59,7 +61,7 @@ Freebuff uses specialized agents instead of sending every task through one model
 
 ## Free access
 
-Freebuff is available in every country. Supported regions receive full access; other regions and VPN users receive limited access, currently DeepSeek V4 Flash and MiMo 2.5 with six one-hour sessions per day.
+Freebuff is available in every country. Supported regions receive full access; other regions and VPN users receive limited access, currently MiMo 2.5 with three one-hour sessions per day, earnable up to seven.
 
 Text ads support the included models. Freebuff shows the applicable session limits and any model-specific data-use notice before you start.
 

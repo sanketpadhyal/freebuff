@@ -2,7 +2,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs'
 import os from 'os'
 import path from 'path'
 
-import { describe, expect, test, beforeEach } from 'bun:test'
+import { describe, expect, test, beforeEach, spyOn } from 'bun:test'
 import { z } from 'zod/v4'
 
 import { initialSessionState } from '../run-state'
@@ -118,7 +118,7 @@ describe('Initial Session State', () => {
   test('discovers project files automatically when projectFiles is undefined', async () => {
     mockFs.readdir = (async (dirPath: string) => {
       if (dirPath === '/test-project') {
-        return ['src', '.git', 'knowledge.md', 'README.md', '.gitignore']
+        return ['src', '.git', 'AGENTS.md', 'README.md', '.gitignore']
       }
       if (dirPath === '/test-project/src') {
         return ['index.ts', 'utils.ts', 'generated.ts']
@@ -157,13 +157,13 @@ describe('Initial Session State', () => {
       false,
     )
     expect(readFilePaths.some((p) => p.endsWith('README.md'))).toBe(false)
-    expect(readFilePaths.some((p) => p.endsWith('knowledge.md'))).toBe(true)
+    expect(readFilePaths.some((p) => p.endsWith('AGENTS.md'))).toBe(true)
   })
 
   test('derives knowledgeFiles from projectFiles when not provided', async () => {
     const projectFiles = {
       'src/index.ts': 'console.log("Hello world");',
-      'knowledge.md': '# Knowledge\n\nThis is a knowledge file.',
+      'AGENTS.md': '# Knowledge\n\nThis is a knowledge file.',
       'claude.md': '# Claude context\n\nThis is claude context.',
       'README.md': '# Project\n\nThis is a readme.',
     }
@@ -177,14 +177,14 @@ describe('Initial Session State', () => {
     })
 
     expect(sessionState.fileContext.knowledgeFiles).toBeDefined()
-    expect(sessionState.fileContext.knowledgeFiles['knowledge.md']).toBe(
+    expect(sessionState.fileContext.knowledgeFiles['AGENTS.md']).toBe(
       '# Knowledge\n\nThis is a knowledge file.',
     )
     expect(sessionState.fileContext.knowledgeFiles['claude.md']).toBeUndefined()
     expect(sessionState.fileContext.knowledgeFiles['README.md']).toBeUndefined()
   })
 
-  test('derives reads knowledgeFiles from claude.md when knowledge.md is not present', async () => {
+  test('derives reads knowledgeFiles from claude.md when AGENTS.md is not present', async () => {
     const projectFiles = {
       'src/index.ts': 'console.log("Hello world");',
       'claude.md': '# Claude context\n\nThis is claude context.',
@@ -201,7 +201,7 @@ describe('Initial Session State', () => {
 
     expect(sessionState.fileContext.knowledgeFiles).toBeDefined()
     expect(
-      sessionState.fileContext.knowledgeFiles['knowledge.md'],
+      sessionState.fileContext.knowledgeFiles['AGENTS.md'],
     ).toBeUndefined()
     expect(sessionState.fileContext.knowledgeFiles['claude.md']).toEqual(
       '# Claude context\n\nThis is claude context.',
@@ -229,7 +229,7 @@ describe('Initial Session State', () => {
 
     expect(sessionState.fileContext.knowledgeFiles).toEqual(knowledgeFiles)
     expect(
-      sessionState.fileContext.knowledgeFiles['knowledge.md'],
+      sessionState.fileContext.knowledgeFiles['AGENTS.md'],
     ).toBeUndefined()
   })
 
@@ -400,6 +400,125 @@ describe('Initial Session State', () => {
     } finally {
       rmSync(tmpDir, { recursive: true, force: true })
     }
+  })
+
+  /**
+   * Hosts that embed this runner in a different process from the repo (Freebuff
+   * Cloud: runner in the web server, repo in a Daytona sandbox) must be able to
+   * replace the filesystem walk outright. Without that, the default loader
+   * reads the SERVER's disk and home directory — see `skillsLoader` docs.
+   */
+  describe('skillsLoader', () => {
+    test('replaces the filesystem walk entirely', async () => {
+      const remoteSkill = {
+        name: 'remote-skill',
+        description: 'Came from another machine',
+        content: '---\nname: remote-skill\ndescription: x\n---\nbody',
+        filePath: '/home/daytona/codebase/.agents/skills/remote-skill/SKILL.md',
+      }
+
+      const sessionState = await initialSessionState({
+        // A path that does not exist on this machine, exactly as Cloud passes.
+        cwd: '/home/daytona/codebase',
+        skillsLoader: async () => ({ 'remote-skill': remoteSkill }),
+        projectFiles: { 'src/index.ts': 'console.log("hello");' },
+        fs: mockFs,
+        logger: mockLogger,
+      })
+
+      expect(Object.keys(sessionState.fileContext.skills!)).toEqual([
+        'remote-skill',
+      ])
+      expect(sessionState.fileContext.skills!['remote-skill'].filePath).toBe(
+        remoteSkill.filePath,
+      )
+    })
+
+    test('wins over skillsDir rather than merging with it', async () => {
+      const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'sdk-skills-test-'))
+      try {
+        const skillDir = path.join(tmpDir, 'local-skill')
+        mkdirSync(skillDir, { recursive: true })
+        writeFileSync(
+          path.join(skillDir, 'SKILL.md'),
+          '---\nname: local-skill\ndescription: On this disk\n---\n\nbody\n',
+        )
+
+        const sessionState = await initialSessionState({
+          cwd: '/test-project',
+          skillsDir: tmpDir,
+          skillsLoader: async () => ({}),
+          projectFiles: { 'src/index.ts': 'console.log("hello");' },
+          fs: mockFs,
+          logger: mockLogger,
+        })
+
+        expect(Object.keys(sessionState.fileContext.skills!)).toHaveLength(0)
+      } finally {
+        rmSync(tmpDir, { recursive: true, force: true })
+      }
+    })
+
+    /**
+     * `skillsLoader` is the per-run fix; this is the backstop for a host that
+     * never sets it. Freebuff Cloud reaches the runner through
+     * initialSessionState, so the guard has to hold at THIS entry point and not
+     * only inside loadSkills.
+     */
+    test('a run that sets nothing still cannot read the home directory', async () => {
+      const tempRoot = mkdtempSync(path.join(os.tmpdir(), 'sdk-home-guard-'))
+      const fakeHome = path.join(tempRoot, 'home')
+      const skillDir = path.join(fakeHome, '.claude', 'skills', 'server-skill')
+      mkdirSync(skillDir, { recursive: true })
+      writeFileSync(
+        path.join(skillDir, 'SKILL.md'),
+        '---\nname: server-skill\ndescription: Lives on the server\n---\n\nbody\n',
+      )
+
+      const homedirSpy = spyOn(os, 'homedir').mockReturnValue(fakeHome)
+      try {
+        const sessionState = await initialSessionState({
+          cwd: '/home/daytona/codebase',
+          projectFiles: { 'src/index.ts': 'console.log("hello");' },
+          fs: mockFs,
+          logger: mockLogger,
+        })
+
+        expect(Object.keys(sessionState.fileContext.skills!)).toHaveLength(0)
+
+        // Same call, opted in: proves the seed was discoverable and this test
+        // is not passing because the fixture was wrong.
+        const optedIn = await initialSessionState({
+          cwd: '/home/daytona/codebase',
+          includeHomeSkills: true,
+          projectFiles: { 'src/index.ts': 'console.log("hello");' },
+          fs: mockFs,
+          logger: mockLogger,
+        })
+
+        expect(Object.keys(optedIn.fileContext.skills!)).toEqual([
+          'server-skill',
+        ])
+      } finally {
+        homedirSpy.mockRestore()
+        rmSync(tempRoot, { recursive: true, force: true })
+      }
+    })
+
+    test('a rejecting loader costs the skills, not the run', async () => {
+      const sessionState = await initialSessionState({
+        cwd: '/home/daytona/codebase',
+        skillsLoader: async () => {
+          throw new Error('sandbox unreachable')
+        },
+        projectFiles: { 'src/index.ts': 'console.log("hello");' },
+        fs: mockFs,
+        logger: mockLogger,
+      })
+
+      expect(sessionState.fileContext.skills).toBeDefined()
+      expect(Object.keys(sessionState.fileContext.skills!)).toHaveLength(0)
+    })
   })
 
   test('initializes empty agent state correctly', async () => {

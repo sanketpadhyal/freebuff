@@ -74,12 +74,13 @@ export async function formatPrompt(
     return (
       message.role === 'user' &&
       message.content[0].type === 'text' &&
-      parseUserMessage(message.content[0].text) !== undefined
+      message.tags?.includes('USER_PROMPT') === true
     )
   }
   const lastUserMessage = messageHistory.findLast(isUserInputMessage)
   const lastUserInput = lastUserMessage
-    ? parseUserMessage(lastUserMessage.content[0].text)
+    ? (parseUserMessage(lastUserMessage.content[0].text) ??
+      lastUserMessage.content[0].text)
     : undefined
 
   const agentTemplate = agentState.agentType
@@ -123,23 +124,27 @@ export async function formatPrompt(
     [PLACEHOLDER.USER_INPUT_PROMPT]: () => escapeString(lastUserInput ?? ''),
     [PLACEHOLDER.INITIAL_AGENT_PROMPT]: () =>
       escapeString(intitialAgentPrompt ?? ''),
-    [PLACEHOLDER.KNOWLEDGE_FILES_CONTENTS]: () =>
-      Object.entries({
+    [PLACEHOLDER.KNOWLEDGE_FILES_CONTENTS]: () => {
+      const blocks = Object.entries({
         ...Object.fromEntries(
           Object.entries(fileContext.knowledgeFiles)
             .filter(([filePath]) => {
               const lowerPath = filePath.toLowerCase()
-              // Root-level knowledge files only (knowledge.md, AGENTS.md, CLAUDE.md)
+              // Root-level knowledge files only (AGENTS.md, CLAUDE.md)
               return KNOWLEDGE_FILE_NAMES_LOWERCASE.includes(lowerPath)
             })
             .map(([path, content]) => [path, content.trim()]),
         ),
         ...fileContext.userKnowledgeFiles,
+      }).map(([path, content]) => {
+        return `\`\`\`${path}\n${content.trim()}\n\`\`\``
       })
-        .map(([path, content]) => {
-          return `\`\`\`${path}\n${content.trim()}\n\`\`\``
-        })
-        .join('\n\n'),
+      if (blocks.length === 0) return ''
+      return `Project instructions:
+Each fenced block below is one instructions file, labeled with its path. Follow them for the rest of the session.
+
+${blocks.join('\n\n')}`
+    },
   }
 
   for (const varName of placeholderValues) {
